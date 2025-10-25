@@ -1,35 +1,34 @@
 // contentScript.js
-// Robust adaptive capture: detects scroll container, retries with progressive downscale
-// until stitched pixel height <= SAFE_CANVAS_HEIGHT.
-// Also keeps PNG->WebP->split logic (19MB) from previous version.
+// Pre-scroll-first capture script:
+// - Pre-scroll to bottom to allow lazy-load and compute stable scrollHeight & positions
+// - Then capture each collected position via safeCapture()
+// - Stitch/export logic as before (PNG -> WebP -> split if needed)
 
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
   window.__FULLPAGE_CAPTURE_INSTALLED = true;
 
-  // --------- config ----------
-  const MAX_BYTES = 19 * 1024 * 1024;
-  const SAFE_CANVAS_HEIGHT = 30000; // target safe max (px) - adjust down if issues
-  const CAPTURE_DELAY_MS = 550;
+  // ---------- CONFIG ----------
+  const MAX_BYTES = 19 * 1024 * 1024;   // 19 MB per output file
+  const CAPTURE_DELAY_MS = 550;         // throttle between captures (ms)
   const CAPTURE_MAX_RETRIES = 3;
   const CAPTURE_RETRY_BASE_DELAY = 300;
   const WEBP_QUALITY = 0.92;
-  const MIN_ZOOM = 0.12; // do not shrink below this
-  const ZOOM_RETRY_FACTOR = 0.88; // reduce zoom by ~12% each retry
-  // ---------------------------
+  const SAFE_CANVAS_HEIGHT = 30000;     // used by stitcher if needed
+  // ----------------------------
 
   let lastCaptureTs = 0;
 
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.action === 'start-capture') {
-      startCapture().catch(e => {
-        console.error('Capture failed', e);
-        alert('Capture failed: ' + (e && e.message ? e.message : e));
+      startCapture().catch(err => {
+        console.error('Capture failed', err);
+        alert('Capture failed: ' + (err && err.message ? err.message : err));
       });
     }
   });
 
-  // ---------- helpers ----------
+  // --------- Utilities ----------
   function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
 
   async function safeCapture() {
@@ -40,6 +39,7 @@
     for (let attempt = 1; attempt <= CAPTURE_MAX_RETRIES; attempt++) {
       const res = await new Promise(resolve => chrome.runtime.sendMessage({ action: 'capture-visible' }, resp => resolve(resp)));
       lastCaptureTs = Date.now();
+
       if (res && res.success) return res.dataUrl;
       if (attempt === CAPTURE_MAX_RETRIES) {
         const err = res?.error || 'Unknown capture error';
@@ -55,7 +55,7 @@
     return new Promise((resolve, reject) => {
       const img = new Image();
       img.onload = () => resolve(img);
-      img.onerror = reject;
+      img.onerror = (e) => reject(e);
       img.src = dataUrl;
     });
   }
@@ -72,101 +72,141 @@
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
 
-  // detect the main scroll container (element with the largest scrollHeight)
+  // Find the element that is the main scroll container (largest scrollHeight)
   function detectScrollContainer() {
     let best = document.scrollingElement || document.documentElement;
-    let maxScroll = (best.scrollHeight || 0);
-    // check common scrollable elements
-    const all = Array.from(document.querySelectorAll('body, html, div, main, section, article'));
-    for (const el of all) {
+    let maxScroll = best ? (best.scrollHeight || 0) : 0;
+
+    // check some common elements and all divs to be safer
+    const candidates = Array.from(document.querySelectorAll('body, html, div, main, section, article'));
+    for (const el of candidates) {
       try {
         const sh = el.scrollHeight || 0;
         if (sh > maxScroll) {
           maxScroll = sh;
           best = el;
         }
-      } catch (e) { /* ignore */ }
+      } catch (e) {
+        // ignore cross-origin or other issues
+      }
     }
     return best;
   }
 
-  // attempt capture at a given CSS zoom. returns { images: [{img,width,height}], totalPixelHeight }
-  async function attemptCaptureAtZoom(zoom) {
-    // apply zoom
-    const origZoom = document.documentElement.style.zoom || '';
-    document.documentElement.style.zoom = String(zoom);
-    // wait for layout and paint
-    await wait(220);
-    // choose scroll container AFTER zoom & layout
-    const scrollEl = detectScrollContainer();
-    const originalScroll = scrollEl.scrollTop;
-    const originalOverflow = scrollEl.style.overflow;
-    scrollEl.style.overflow = 'hidden';
+  // Pre-scroll the container from top to bottom to allow lazy-loads and compute stable scrollHeight.
+  // Returns final scrollHeight (CSS px) and captured positions array (CSS y offsets).
+  // Options:
+  //   stepPx: how many CSS pixels to scroll each step (default = viewport height)
+  //   stabilizeRounds: how many consecutive checks of unchanged scrollHeight to consider stable
+  //   waitPerStepMs: wait after each scroll to allow loading/paint
+  async function preScrollAndStabilize(scrollEl, { stepPx = null, stabilizeRounds = 2, waitPerStepMs = 500 } = {}) {
+    const origScrollTop = scrollEl.scrollTop;
+    const origOverflow = scrollEl.style.overflow;
+    scrollEl.style.overflow = 'hidden'; // prevent extra UI changes during pre-scroll
 
-    const totalCssHeight = Math.max(scrollEl.scrollHeight || document.documentElement.scrollHeight, document.body.scrollHeight || 0);
-    const viewportCssH = window.innerHeight;
+    // compute step = viewport height CSS px if not provided
+    const viewportH = window.innerHeight;
+    if (!stepPx) stepPx = viewportH;
 
-    // build positions in CSS pixels
+    // start from top
+    try {
+      scrollEl.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+      await wait(120);
+    } catch (e) {}
+
+    // iterative prescroll: walk to bottom, capturing current scrollHeight
+    let lastHeight = Math.max(scrollEl.scrollHeight || 0, document.documentElement.scrollHeight || 0);
+    let stableCount = 0;
+    let y = 0;
+
+    // first pass: scroll to bottom in steps
+    while (y < lastHeight - 1) {
+      y = Math.min(y + stepPx, lastHeight - viewportH);
+      try {
+        scrollEl.scrollTo({ top: y, left: 0, behavior: 'instant' });
+      } catch (e) {}
+      // wait paint & lazy-load
+      await wait(waitPerStepMs);
+
+      // re-evaluate scrollHeight (page may have injected content)
+      const currentHeight = Math.max(scrollEl.scrollHeight || 0, document.documentElement.scrollHeight || 0);
+
+      if (currentHeight !== lastHeight) {
+        // content grew — reset walking to reflect new height
+        lastHeight = currentHeight;
+        // continue from current y (which may now be < new bottom)
+        // do not increase stableCount
+        stableCount = 0;
+      }
+
+      // If at/near bottom and content stable for a couple rounds, we can stop
+      if (y >= lastHeight - viewportH - 1) {
+        // wait additional stabilization rounds
+        stableCount++;
+        if (stableCount >= stabilizeRounds) break;
+      }
+    }
+
+    // final bottom pass to ensure bottom reached and stable
+    try {
+      scrollEl.scrollTo({ top: lastHeight - viewportH, left: 0, behavior: 'instant' });
+    } catch (e) {}
+    await wait(waitPerStepMs);
+
+    // read final stable height and reset scroll to top
+    const finalHeight = Math.max(scrollEl.scrollHeight || 0, document.documentElement.scrollHeight || 0);
+
+    // build final positions array (CSS offsets)
     const positions = [];
-    for (let y = 0; y < totalCssHeight; y += viewportCssH) {
-      positions.push(Math.min(y, totalCssHeight - viewportCssH));
-      if (y + viewportCssH >= totalCssHeight) break;
+    for (let pos = 0; pos < finalHeight; pos += viewportH) {
+      positions.push(Math.min(pos, finalHeight - viewportH));
+      if (pos + viewportH >= finalHeight) break;
     }
 
-    const dataUrls = [];
-    for (let i = 0; i < positions.length; i++) {
-      const y = positions[i];
-      // scroll the detected container
-      scrollEl.scrollTo({ top: y, left: 0, behavior: 'instant' });
-      // wait paint & lazy load
-      await new Promise(r => requestAnimationFrame(() => setTimeout(r, 420)));
-      const dataUrl = await safeCapture();
-      dataUrls.push(dataUrl);
-    }
+    // restore original scroll/overflow
+    try { scrollEl.scrollTo({ top: origScrollTop, left: 0, behavior: 'instant' }); } catch (e) {}
+    scrollEl.style.overflow = origOverflow;
 
-    // restore scroll & overflow but keep zoom applied until caller finishes
-    scrollEl.scrollTo({ top: originalScroll, left: 0, behavior: 'instant' });
-    scrollEl.style.overflow = originalOverflow;
-    // load images to get actual pixel heights returned by captureVisibleTab
-    const images = [];
-    for (const d of dataUrls) {
-      const img = await loadImage(d);
-      images.push({ img, width: img.width, height: img.height });
-    }
-
-    // compute total pixel height
-    const totalPixelHeight = images.reduce((s, it) => s + it.height, 0);
-    // restore original zoom now (caller may want to)
-    document.documentElement.style.zoom = origZoom || '';
-    return { images, totalPixelHeight, positionsCount: positions.length };
+    return { finalHeight, positions, viewportH };
   }
 
-  // stitch images into single canvas (or tiled if too tall) and return array of { blob, mime }
-  async function stitchAndExportImages(images, preferQuality = WEBP_QUALITY) {
+  // Stitch images vertically and return array of blobs (may be multiple parts if too tall).
+  // Uses PNG -> WebP -> split logic similar to earlier scripts.
+  async function stitchAndExportBlobs(images) {
     const width = Math.max(...images.map(i => i.width));
     const totalHeight = images.reduce((s, it) => s + it.height, 0);
 
-    // if safe -> single canvas
-    if (totalHeight <= SAFE_CANVAS_HEIGHT) {
+    // Helper to make single canvas and return blob for a given mime
+    async function canvasBlobFromImages(imgArray, mime='image/png', quality=0.92) {
+      const w = Math.max(...imgArray.map(i => i.width));
+      const h = imgArray.reduce((s, it) => s + it.height, 0);
       const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = totalHeight;
+      canvas.width = w;
+      canvas.height = h;
       const ctx = canvas.getContext('2d');
       let y = 0;
-      for (const it of images) {
+      for (const it of imgArray) {
         ctx.drawImage(it.img, 0, y, it.width, it.height);
         y += it.height;
       }
-      // prefer PNG if small enough
-      const png = await canvasToBlob(canvas, 'image/png');
-      if (png.size <= MAX_BYTES) return [{ blob: png, mime: 'image/png' }];
-      const webp = await canvasToBlob(canvas, 'image/webp', preferQuality);
-      if (webp.size <= MAX_BYTES) return [{ blob: webp, mime: 'image/webp' }];
-      // fallback: return webp (may be > MAX_BYTES) and caller can split
-      return [{ blob: webp, mime: 'image/webp' }];
+      const blob = await canvasToBlob(canvas, mime, quality);
+      return { blob, width: w, height: h };
     }
 
-    // tiled fallback (split into vertical tiles each <= SAFE_CANVAS_HEIGHT)
+    // If total height is small enough for single canvas, try single export
+    if (totalHeight <= SAFE_CANVAS_HEIGHT) {
+      const pngRes = await canvasBlobFromImages(images, 'image/png', 0.92);
+      if (pngRes.blob.size <= MAX_BYTES) return [{ blob: pngRes.blob, mime: 'image/png' }];
+
+      // try webp
+      const webpRes = await canvasBlobFromImages(images, 'image/webp', WEBP_QUALITY);
+      if (webpRes.blob.size <= MAX_BYTES) return [{ blob: webpRes.blob, mime: 'image/webp' }];
+
+      // return webp even if larger (caller will split)
+      return [{ blob: webpRes.blob, mime: 'image/webp' }];
+    }
+
+    // If too tall, tile into vertical parts each <= SAFE_CANVAS_HEIGHT
     const parts = [];
     let cursor = 0;
     while (cursor < totalHeight) {
@@ -176,7 +216,7 @@
       canvas.height = tileH;
       const ctx = canvas.getContext('2d');
 
-      // draw the correct slices of images into this tile
+      // draw relevant slices
       let yInTile = 0;
       let acc = 0;
       for (const it of images) {
@@ -195,146 +235,119 @@
           if (yInTile >= tileH) break;
         }
       }
-      const tileWebp = await canvasToBlob(canvas, 'image/webp', preferQuality);
+
+      // export tile as webp (smaller)
+      const tileWebp = await canvasToBlob(canvas, 'image/webp', WEBP_QUALITY);
       parts.push({ blob: tileWebp, mime: 'image/webp' });
       cursor += tileH;
     }
     return parts;
   }
 
-  // if large single stitched blob > MAX_BYTES, split into size-limited WebPs (by chunking image array)
-  async function splitIntoSizedWebPs(images, quality = WEBP_QUALITY) {
-    const batches = [];
+  // If a stitched blob is still > MAX_BYTES, split into multiple webp parts by chunking images into batches
+  async function splitIntoSizedWebPs(images) {
+    const result = [];
     let current = [];
     for (let i = 0; i < images.length; i++) {
       const candidate = images[i];
       const tryBatch = current.concat([candidate]);
-      const parts = await stitchAndExportImages(tryBatch, quality);
-      // compute combined size (sum of parts)
-      const combined = parts.reduce((s, p) => s + (p.blob?.size || 0), 0);
-      if (combined <= MAX_BYTES) {
+      const parts = await stitchAndExportBlobs(tryBatch);
+      const totalSize = parts.reduce((s, p) => s + (p.blob?.size || 0), 0);
+      if (totalSize <= MAX_BYTES) {
         current = tryBatch;
       } else {
         if (current.length === 0) {
-          // single candidate too big — downscale this image as a fallback
+          // single candidate too large — downscale the single image
           const it = candidate;
           const tmp = document.createElement('canvas');
           tmp.width = Math.max(1, Math.floor(it.width / 2));
           tmp.height = Math.max(1, Math.floor(it.height / 2));
           const tctx = tmp.getContext('2d');
           tctx.drawImage(it.img, 0, 0, tmp.width, tmp.height);
-          const scaled = await canvasToBlob(tmp, 'image/webp', Math.max(0.75, quality - 0.1));
-          batches.push({ blob: scaled, mime: 'image/webp' });
+          const scaledBlob = await canvasToBlob(tmp, 'image/webp', Math.max(0.75, WEBP_QUALITY - 0.1));
+          result.push({ blob: scaledBlob, mime: 'image/webp' });
         } else {
-          // finalize current
-          const finalParts = await stitchAndExportImages(current, quality);
-          for (const p of finalParts) batches.push({ blob: p.blob, mime: p.mime });
+          const finalized = await stitchAndExportBlobs(current);
+          for (const p of finalized) result.push({ blob: p.blob, mime: p.mime });
           current = [candidate];
         }
       }
     }
     if (current.length > 0) {
-      const finalParts = await stitchAndExportImages(current, WEBP_QUALITY);
-      for (const p of finalParts) batches.push({ blob: p.blob, mime: p.mime });
+      const finalized = await stitchAndExportBlobs(current);
+      for (const p of finalized) result.push({ blob: p.blob, mime: p.mime });
     }
-    return batches;
+    return result;
   }
 
-  // ---------- main ----------
+  // ---------- Main capture flow ----------
   async function startCapture() {
     if (!document.body) throw new Error('No document body');
 
     const scrollEl = detectScrollContainer();
+    const originalScroll = scrollEl.scrollTop;
     const originalOverflow = scrollEl.style.overflow;
-    const originalScrollTop = scrollEl.scrollTop;
     const origZoom = document.documentElement.style.zoom || '';
 
     try {
-      // compute initial heights and DPR
-      let totalCssH = Math.max(scrollEl.scrollHeight || document.documentElement.scrollHeight, document.body.scrollHeight || 0);
-      const dpr = window.devicePixelRatio || 1;
-      console.log('[capture] initial totalCssH', totalCssH, 'dpr', dpr);
+      // 1) PRE-SCROLL: walk the page to the bottom allowing lazy-loaded content to append and stabilize
+      const pre = await preScrollAndStabilize(scrollEl, { stabilizeRounds: 2, waitPerStepMs: 550 });
+      console.log('[preScroll] finalHeight', pre.finalHeight, 'positions', pre.positions.length);
 
-      // estimate pixel height of stitched image at zoom=1
-      let estimatedPixelH = Math.round(totalCssH * dpr);
-      console.log('[capture] estimatedPixelH (no zoom)', estimatedPixelH, 'SAFE limit', SAFE_CANVAS_HEIGHT);
-
-      // if already safe, just capture at zoom=1
-      let zoom = 1;
-      if (estimatedPixelH <= SAFE_CANVAS_HEIGHT) {
-        // single attempt at original zoom
-        console.log('[capture] within safe canvas, capturing at zoom=1');
-      } else {
-        // compute initial zoom to try
-        zoom = Math.max(MIN_ZOOM, SAFE_CANVAS_HEIGHT / estimatedPixelH);
-        console.log('[capture] initial computed zoom', zoom);
+      // 2) CAPTURE each collected position (these are CSS offsets reflecting stable layout)
+      // We'll scroll the same container to each position and call safeCapture()
+      const capturedDataUrls = [];
+      for (let i = 0; i < pre.positions.length; i++) {
+        const y = pre.positions[i];
+        try { scrollEl.scrollTo({ top: y, left: 0, behavior: 'instant' }); } catch (e) {}
+        // Wait for paint & lazy loads
+        await new Promise(r => requestAnimationFrame(() => setTimeout(r, 420)));
+        const dataUrl = await safeCapture();
+        capturedDataUrls.push(dataUrl);
       }
 
-      // We'll attempt captures with progressive zoom reductions until stitched totalPixelHeight <= SAFE_CANVAS_HEIGHT
-      let attempt = 0;
-      let capturedImages = null;
-      let lastPositionsCount = 0;
-
-      while (true) {
-        attempt++;
-        console.log(`[capture] attempt ${attempt} with zoom ${zoom.toFixed(3)}`);
-        const { images, totalPixelHeight, positionsCount } = await attemptCaptureAtZoom(zoom);
-        console.log(`[capture] got images count ${images.length}, totalPixelHeight ${totalPixelHeight}, positions ${positionsCount}`);
-        // If safe, keep these images and break
-        if (totalPixelHeight <= SAFE_CANVAS_HEIGHT) {
-          capturedImages = images;
-          lastPositionsCount = positionsCount;
-          console.log('[capture] totalPixelHeight is safe -> proceed stitching');
-          break;
-        }
-        // else reduce zoom and retry (if possible)
-        if (zoom <= MIN_ZOOM + 1e-6) {
-          // we cannot reduce more; accept images and fall back to tiled stitching
-          capturedImages = images;
-          lastPositionsCount = positionsCount;
-          console.warn('[capture] reached MIN_ZOOM but still too tall; will use tiled fallback');
-          break;
-        }
-        // reduce zoom and retry
-        zoom = Math.max(MIN_ZOOM, zoom * ZOOM_RETRY_FACTOR);
-        console.log('[capture] reducing zoom to', zoom);
-        // slight delay before retry
-        await wait(120);
+      // 3) Convert captured data URLs to Image objects (these images are in device pixels)
+      const images = [];
+      for (const d of capturedDataUrls) {
+        const img = await loadImage(d);
+        images.push({ img, width: img.width, height: img.height });
       }
 
-      // Now we have capturedImages (array). Stitch & export using existing logic (PNG->WebP->split)
-      const firstStitch = await stitchAndExportImages(capturedImages, WEBP_QUALITY);
-      // if single small PNG returned:
-      if (firstStitch.length === 1 && firstStitch[0].mime === 'image/png' && firstStitch[0].blob.size <= MAX_BYTES) {
+      // 4) Stitch & export (PNG -> WebP -> split)
+      const stitched = await stitchAndExportBlobs(images);
+
+      // If stitched result is single png under limit, save it; else if webp single, save it; else split
+      if (stitched.length === 1 && stitched[0].mime === 'image/png' && stitched[0].blob.size <= MAX_BYTES) {
         const name = `${(new URL(location.href)).hostname.replace(/\./g,'_')}_fullpage.png`;
-        downloadBlob(firstStitch[0].blob, name);
-        alert('Saved PNG (under limit).');
-        return;
-      }
-      // try webp single
-      if (firstStitch.length === 1 && firstStitch[0].mime.includes('webp') && firstStitch[0].blob.size <= MAX_BYTES) {
-        const name = `${(new URL(location.href)).hostname.replace(/\./g,'_')}_fullpage.webp`;
-        downloadBlob(firstStitch[0].blob, name);
-        alert('Saved WebP (single file under limit).');
+        downloadBlob(stitched[0].blob, name);
+        alert('Saved full-page PNG (under limit).');
         return;
       }
 
-      // else split into sized webps
-      const parts = await splitIntoSizedWebPs(capturedImages, WEBP_QUALITY);
+      if (stitched.length === 1 && stitched[0].mime.includes('webp') && stitched[0].blob.size <= MAX_BYTES) {
+        const name = `${(new URL(location.href)).hostname.replace(/\./g,'_')}_fullpage.webp`;
+        downloadBlob(stitched[0].blob, name);
+        alert('Saved full-page WebP (single file).');
+        return;
+      }
+
+      // Otherwise, ensure each exported piece <= MAX_BYTES (split if needed)
+      const parts = await splitIntoSizedWebPs(images);
       for (let i = 0; i < parts.length; i++) {
         const p = parts[i];
-        const ext = (p.mime && p.mime.includes('webp')) ? 'webp' : 'png';
+        const ext = p.mime && p.mime.includes('webp') ? 'webp' : 'png';
         const fname = `${(new URL(location.href)).hostname.replace(/\./g,'_')}_part${i+1}.${ext}`;
         downloadBlob(p.blob, fname);
       }
-      alert(`Saved ${parts.length} parts.`);
+      alert(`Saved ${parts.length} image(s).`);
 
     } finally {
-      // cleanup restore
-      try { detectScrollContainer().style.overflow = originalOverflow; } catch(e) {}
-      try { detectScrollContainer().scrollTo({ top: originalScrollTop, left: 0, behavior: 'instant' }); } catch(e) {}
+      // restore state
+      try { scrollEl.style.overflow = originalOverflow; } catch (e) {}
+      try { scrollEl.scrollTo({ top: originalScroll, left: 0, behavior: 'instant' }); } catch (e) {}
       document.documentElement.style.zoom = origZoom || '';
     }
   }
 
 })();
+
