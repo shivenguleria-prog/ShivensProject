@@ -2,14 +2,14 @@
 // Full-page scroll + capture + stitch script with:
 //  - safeCapture() to avoid MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND quota
 //  - retries on capture failures
-//  - splitting output images so each final PNG <= 20 MB (approx)
+//  - splitting output images so each final PNG <= 19 MB (approx)
 //  - simple hiding of fixed/sticky elements during capture
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
   window.__FULLPAGE_CAPTURE_INSTALLED = true;
 
   // ---- Configuration ----
-  const MAX_BYTES = 20 * 1024 * 1024; // 20 MB
+  const MAX_BYTES = 19 * 1024 * 1024; // 19 MB limit per output image
   const CAPTURE_DELAY_MS = 550; // safe delay between captures (ms)
   const CAPTURE_MAX_RETRIES = 3; // retries per capture
   const CAPTURE_RETRY_BASE_DELAY = 300; // ms, exponential backoff base
@@ -196,7 +196,7 @@
       } else {
         if (currentBatch.length === 0) {
           // Single candidate itself exceeds MAX_BYTES. Try downscaling it (50%) as fallback.
-          console.warn('Single chunk exceeds 20MB, attempting scaling on index', i);
+          console.warn('Single chunk exceeds 19MB, attempting scaling on index', i);
 
           // scale down the single image by 50% (reduces size significantly)
           const it = candidate;
@@ -211,7 +211,7 @@
             batches.push({ blob: scaledBlob, info: `scaled_single_${i}` });
             currentBatch = [];
           } else {
-            // If still too large, push as-is (user will get >20MB)
+            // If still too large, push as-is (user will get >19MB)
             batches.push({ blob: testBlob, info: `single_too_large_${i}` });
             currentBatch = [];
           }
