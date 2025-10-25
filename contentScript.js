@@ -1,327 +1,245 @@
 // contentScript.js
-// Full-page capture with:
-// - Pre-scroll to allow lazy-loading
-// - Automatic zoom adjustment based on DPR and page height (now using CSS transform: scale)
-// - Safe stitched export (PNG → WebP → split if >19MB)
+// Full-page screenshot with:
+// - Pre-scroll (lazy-load friendly)
+// - Hard-coded zoom scale = 1 / 1.5
+// - Safe stitched export (PNG → WebP → split ≤19 MB)
 
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
   window.__FULLPAGE_CAPTURE_INSTALLED = true;
 
-  // ---------- CONFIG ----------
-  const MAX_BYTES = 19 * 1024 * 1024; // 19 MB limit
+  const MAX_BYTES = 19 * 1024 * 1024;   // 19 MB limit
   const CAPTURE_DELAY_MS = 550;
   const CAPTURE_MAX_RETRIES = 3;
   const CAPTURE_RETRY_BASE_DELAY = 300;
   const WEBP_QUALITY = 0.92;
-  const SAFE_CANVAS_HEIGHT = 30000; // Chrome safe limit
-  // ----------------------------
+  const SAFE_CANVAS_HEIGHT = 30000;     // Chrome GPU limit
 
   let lastCaptureTs = 0;
 
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg && msg.action === 'start-capture') {
+  chrome.runtime.onMessage.addListener(msg => {
+    if (msg?.action === "start-capture") {
       startCapture().catch(err => {
-        console.error('Capture failed', err);
-        alert('Capture failed: ' + (err && err.message ? err.message : err));
+        console.error("Capture failed", err);
+        alert("Capture failed: " + (err?.message || err));
       });
     }
   });
 
-  // ----------- Utilities -----------
-  function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
+  function wait(ms){ return new Promise(r=>setTimeout(r,ms)); }
 
-  async function safeCapture() {
+  async function safeCapture(){
     const now = Date.now();
     const since = now - lastCaptureTs;
-    if (since < CAPTURE_DELAY_MS) await wait(CAPTURE_DELAY_MS - since);
+    if(since < CAPTURE_DELAY_MS) await wait(CAPTURE_DELAY_MS - since);
 
-    for (let attempt = 1; attempt <= CAPTURE_MAX_RETRIES; attempt++) {
-      const res = await new Promise(resolve =>
-        chrome.runtime.sendMessage({ action: 'capture-visible' }, resp => resolve(resp))
-      );
+    for(let attempt=1; attempt<=CAPTURE_MAX_RETRIES; attempt++){
+      const res = await new Promise(r=>chrome.runtime.sendMessage({action:"capture-visible"},resp=>r(resp)));
       lastCaptureTs = Date.now();
-
-      if (res && res.success) return res.dataUrl;
-      if (attempt === CAPTURE_MAX_RETRIES) {
-        const err = res?.error || 'Unknown capture error';
-        throw new Error('capture failed: ' + err);
-      }
-      const backoff = CAPTURE_RETRY_BASE_DELAY * Math.pow(2, attempt - 1);
-      await wait(backoff);
+      if(res?.success) return res.dataUrl;
+      if(attempt === CAPTURE_MAX_RETRIES) throw new Error(res?.error || "Unknown capture error");
+      await wait(CAPTURE_RETRY_BASE_DELAY * Math.pow(2, attempt-1));
     }
-    throw new Error('capture failed unexpectedly');
+    throw new Error("capture failed unexpectedly");
   }
 
-  function loadImage(dataUrl) {
-    return new Promise((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => resolve(img);
-      img.onerror = reject;
-      img.src = dataUrl;
+  function loadImage(dataUrl){
+    return new Promise((resolve,reject)=>{
+      const img=new Image();
+      img.onload=()=>resolve(img);
+      img.onerror=reject;
+      img.src=dataUrl;
     });
   }
 
-  function canvasToBlob(canvas, type = 'image/png', quality = 0.92) {
-    return new Promise(resolve => canvas.toBlob(b => resolve(b), type, quality));
+  function canvasToBlob(canvas,type="image/png",quality=0.92){
+    return new Promise(r=>canvas.toBlob(b=>r(b),type,quality));
   }
 
-  function downloadBlob(blob, filename) {
+  function downloadBlob(blob,filename){
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = filename;
+    const a = document.createElement("a");
+    a.href=url; a.download=filename;
     document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    setTimeout(()=>URL.revokeObjectURL(url),5000);
   }
 
-  function detectScrollContainer() {
+  function detectScrollContainer(){
     let best = document.scrollingElement || document.documentElement;
-    let maxScroll = best ? (best.scrollHeight || 0) : 0;
-    const candidates = Array.from(document.querySelectorAll('body, html, div, main, section, article'));
-    for (const el of candidates) {
-      try {
-        const sh = el.scrollHeight || 0;
-        if (sh > maxScroll) {
-          maxScroll = sh;
-          best = el;
-        }
-      } catch {}
+    let maxScroll = best.scrollHeight || 0;
+    const els = Array.from(document.querySelectorAll("body,html,div,main,section,article"));
+    for(const el of els){
+      try{
+        if(el.scrollHeight > maxScroll){ maxScroll=el.scrollHeight; best=el; }
+      }catch{}
     }
     return best;
   }
 
-  async function preScrollAndStabilize(scrollEl, { stepPx = null, stabilizeRounds = 2, waitPerStepMs = 500 } = {}) {
-    const origScrollTop = scrollEl.scrollTop;
+  async function preScrollAndStabilize(scrollEl,{stepPx=null,stabilizeRounds=2,waitPerStepMs=500}={}){
+    const origTop = scrollEl.scrollTop;
     const origOverflow = scrollEl.style.overflow;
-    scrollEl.style.overflow = 'hidden';
+    scrollEl.style.overflow="hidden";
 
     const viewportH = window.innerHeight;
-    if (!stepPx) stepPx = viewportH;
+    if(!stepPx) stepPx = viewportH;
 
-    try { scrollEl.scrollTo({ top: 0, left: 0, behavior: 'instant' }); await wait(120); } catch {}
+    try{scrollEl.scrollTo({top:0,left:0,behavior:"instant"});await wait(120);}catch{}
+    let lastHeight=Math.max(scrollEl.scrollHeight,document.documentElement.scrollHeight);
+    let stable=0,y=0;
 
-    let lastHeight = Math.max(scrollEl.scrollHeight || 0, document.documentElement.scrollHeight || 0);
-    let stableCount = 0;
-    let y = 0;
-
-    while (y < lastHeight - 1) {
-      y = Math.min(y + stepPx, lastHeight - viewportH);
-      try { scrollEl.scrollTo({ top: y, left: 0, behavior: 'instant' }); } catch {}
+    while(y<lastHeight-1){
+      y=Math.min(y+stepPx,lastHeight-viewportH);
+      scrollEl.scrollTo({top:y,left:0,behavior:"instant"});
       await wait(waitPerStepMs);
-      const currentHeight = Math.max(scrollEl.scrollHeight || 0, document.documentElement.scrollHeight || 0);
-      if (currentHeight !== lastHeight) {
-        lastHeight = currentHeight;
-        stableCount = 0;
-      }
-      if (y >= lastHeight - viewportH - 1) {
-        stableCount++;
-        if (stableCount >= stabilizeRounds) break;
-      }
+      const h=Math.max(scrollEl.scrollHeight,document.documentElement.scrollHeight);
+      if(h!==lastHeight){ lastHeight=h; stable=0; }
+      if(y>=lastHeight-viewportH-1){ stable++; if(stable>=stabilizeRounds) break; }
     }
-
-    try { scrollEl.scrollTo({ top: lastHeight - viewportH, left: 0, behavior: 'instant' }); } catch {}
+    scrollEl.scrollTo({top:lastHeight-viewportH,left:0,behavior:"instant"});
     await wait(waitPerStepMs);
 
-    const finalHeight = Math.max(scrollEl.scrollHeight || 0, document.documentElement.scrollHeight || 0);
-    const positions = [];
-    for (let pos = 0; pos < finalHeight; pos += viewportH) {
-      positions.push(Math.min(pos, finalHeight - viewportH));
-      if (pos + viewportH >= finalHeight) break;
+    const finalH=Math.max(scrollEl.scrollHeight,document.documentElement.scrollHeight);
+    const positions=[];
+    for(let p=0;p<finalH;p+=viewportH){
+      positions.push(Math.min(p,finalH-viewportH));
+      if(p+viewportH>=finalH) break;
     }
 
-    try { scrollEl.scrollTo({ top: origScrollTop, left: 0, behavior: 'instant' }); } catch {}
-    scrollEl.style.overflow = origOverflow;
-
-    return { finalHeight, positions, viewportH };
+    scrollEl.scrollTo({top:origTop,left:0,behavior:"instant"});
+    scrollEl.style.overflow=origOverflow;
+    return {finalHeight:finalH,positions,viewportH};
   }
 
-  async function stitchAndExportBlobs(images) {
-    const width = Math.max(...images.map(i => i.width));
-    const totalHeight = images.reduce((s, it) => s + it.height, 0);
+  async function stitchAndExportBlobs(images){
+    const width=Math.max(...images.map(i=>i.width));
+    const totalH=images.reduce((s,it)=>s+it.height,0);
 
-    async function canvasBlob(imgArr, mime = 'image/png', q = 0.92) {
-      const w = Math.max(...imgArr.map(i => i.width));
-      const h = imgArr.reduce((s, it) => s + it.height, 0);
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      let y = 0;
-      for (const it of imgArr) {
-        ctx.drawImage(it.img, 0, y, it.width, it.height);
-        y += it.height;
-      }
-      const blob = await canvasToBlob(canvas, mime, q);
-      return { blob, width: w, height: h };
+    async function makeCanvas(imgs,mime="image/png",q=0.92){
+      const w=Math.max(...imgs.map(i=>i.width));
+      const h=imgs.reduce((s,it)=>s+it.height,0);
+      const c=document.createElement("canvas");
+      c.width=w; c.height=h;
+      const ctx=c.getContext("2d");
+      let y=0;
+      for(const it of imgs){ ctx.drawImage(it.img,0,y,it.width,it.height); y+=it.height; }
+      const b=await canvasToBlob(c,mime,q);
+      return {blob:b,width:w,height:h};
     }
 
-    if (totalHeight <= SAFE_CANVAS_HEIGHT) {
-      const png = await canvasBlob(images, 'image/png', 0.92);
-      if (png.blob.size <= MAX_BYTES) return [{ blob: png.blob, mime: 'image/png' }];
-
-      const webp = await canvasBlob(images, 'image/webp', WEBP_QUALITY);
-      if (webp.blob.size <= MAX_BYTES) return [{ blob: webp.blob, mime: 'image/webp' }];
-
-      return [{ blob: webp.blob, mime: 'image/webp' }];
+    if(totalH<=SAFE_CANVAS_HEIGHT){
+      const png=await makeCanvas(images,"image/png",0.92);
+      if(png.blob.size<=MAX_BYTES) return [{blob:png.blob,mime:"image/png"}];
+      const webp=await makeCanvas(images,"image/webp",WEBP_QUALITY);
+      if(webp.blob.size<=MAX_BYTES) return [{blob:webp.blob,mime:"image/webp"}];
+      return [{blob:webp.blob,mime:"image/webp"}];
     }
 
-    const parts = [];
-    let cursor = 0;
-    while (cursor < totalHeight) {
-      const tileH = Math.min(SAFE_CANVAS_HEIGHT, totalHeight - cursor);
-      const canvas = document.createElement('canvas');
-      canvas.width = width;
-      canvas.height = tileH;
-      const ctx = canvas.getContext('2d');
-
-      let yInTile = 0, acc = 0;
-      for (const it of images) {
-        const imgTop = acc, imgBottom = acc + it.height;
-        acc += it.height;
-        const tileTop = cursor, tileBottom = cursor + tileH;
-        const interTop = Math.max(tileTop, imgTop);
-        const interBottom = Math.min(tileBottom, imgBottom);
-        if (interBottom > interTop) {
-          const srcY = interTop - imgTop;
-          const drawH = interBottom - interTop;
-          ctx.drawImage(it.img, 0, srcY, it.width, drawH, 0, yInTile, it.width, drawH);
-          yInTile += drawH;
-          if (yInTile >= tileH) break;
+    const parts=[];
+    let cursor=0;
+    while(cursor<totalH){
+      const h=Math.min(SAFE_CANVAS_HEIGHT,totalH-cursor);
+      const c=document.createElement("canvas");
+      c.width=width; c.height=h;
+      const ctx=c.getContext("2d");
+      let yTile=0,acc=0;
+      for(const it of images){
+        const top=acc,bottom=acc+it.height; acc+=it.height;
+        const tTop=cursor,tBot=cursor+h;
+        const iTop=Math.max(tTop,top),iBot=Math.min(tBot,bottom);
+        if(iBot>iTop){
+          const srcY=iTop-top,drawH=iBot-iTop;
+          ctx.drawImage(it.img,0,srcY,it.width,drawH,0,yTile,it.width,drawH);
+          yTile+=drawH; if(yTile>=h) break;
         }
       }
-
-      const tileWebp = await canvasToBlob(canvas, 'image/webp', WEBP_QUALITY);
-      parts.push({ blob: tileWebp, mime: 'image/webp' });
-      cursor += tileH;
+      const tile=await canvasToBlob(c,"image/webp",WEBP_QUALITY);
+      parts.push({blob:tile,mime:"image/webp"});
+      cursor+=h;
     }
     return parts;
   }
 
-  async function splitIntoSizedWebPs(images) {
-    const result = [];
-    let current = [];
-    for (let i = 0; i < images.length; i++) {
-      const candidate = images[i];
-      const tryBatch = current.concat([candidate]);
-      const parts = await stitchAndExportBlobs(tryBatch);
-      const totalSize = parts.reduce((s, p) => s + (p.blob?.size || 0), 0);
-      if (totalSize <= MAX_BYTES) {
-        current = tryBatch;
-      } else {
-        if (current.length === 0) {
-          const it = candidate;
-          const tmp = document.createElement('canvas');
-          tmp.width = Math.max(1, Math.floor(it.width / 2));
-          tmp.height = Math.max(1, Math.floor(it.height / 2));
-          tmp.getContext('2d').drawImage(it.img, 0, 0, tmp.width, tmp.height);
-          const scaledBlob = await canvasToBlob(tmp, 'image/webp', Math.max(0.75, WEBP_QUALITY - 0.1));
-          result.push({ blob: scaledBlob, mime: 'image/webp' });
-        } else {
-          const finalized = await stitchAndExportBlobs(current);
-          for (const p of finalized) result.push({ blob: p.blob, mime: p.mime });
-          current = [candidate];
+  async function splitIntoSizedWebPs(images){
+    const result=[]; let current=[];
+    for(let i=0;i<images.length;i++){
+      const candidate=images[i];
+      const batch=current.concat([candidate]);
+      const parts=await stitchAndExportBlobs(batch);
+      const size=parts.reduce((s,p)=>s+(p.blob?.size||0),0);
+      if(size<=MAX_BYTES){ current=batch; }
+      else{
+        if(current.length===0){
+          const it=candidate;
+          const tmp=document.createElement("canvas");
+          tmp.width=Math.floor(it.width/2); tmp.height=Math.floor(it.height/2);
+          tmp.getContext("2d").drawImage(it.img,0,0,tmp.width,tmp.height);
+          const scaled=await canvasToBlob(tmp,"image/webp",Math.max(0.75,WEBP_QUALITY-0.1));
+          result.push({blob:scaled,mime:"image/webp"});
+        }else{
+          const final=await stitchAndExportBlobs(current);
+          for(const p of final) result.push({blob:p.blob,mime:p.mime});
+          current=[candidate];
         }
       }
     }
-    if (current.length > 0) {
-      const finalized = await stitchAndExportBlobs(current);
-      for (const p of finalized) result.push({ blob: p.blob, mime: p.mime });
+    if(current.length>0){
+      const final=await stitchAndExportBlobs(current);
+      for(const p of final) result.push({blob:p.blob,mime:p.mime});
     }
     return result;
   }
 
-  // ----------- Main capture flow -----------
-  async function startCapture() {
-    if (!document.body) throw new Error('No document body');
+  async function startCapture(){
+    const scrollEl=detectScrollContainer();
+    const origScroll=scrollEl.scrollTop;
+    const origOverflow=scrollEl.style.overflow;
+    const origZoom=document.documentElement.style.zoom || "";
 
-    const scrollEl = detectScrollContainer();
-    const originalScroll = scrollEl.scrollTop;
-    const originalOverflow = scrollEl.style.overflow;
-    
-    // Save original styles for restoration
-    const origZoom = document.documentElement.style.zoom || '';
-    const origTransform = document.body.style.transform || '';
-    const origTransformOrigin = document.body.style.transformOrigin || '';
-    const origBodyWidth = document.body.style.width || '';
+    try{
+      // --- Hard-code effective DPR = 1.5 (zoom out to 1/1.5 ≈ 0.6667) ---
+      document.documentElement.style.zoom = (1/1.5).toString();
+      console.log("[Fixed Zoom] Applying zoom scale 0.667 for DPR≈1.5");
+      await wait(300);
 
-    try {
-      // === Auto Zoom Adjustment (Dynamic DPR Scaling) ===
-      const cssHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-      const dpr = window.devicePixelRatio || 1;
-      const estimatedPixels = cssHeight * dpr;
-      
-      if (estimatedPixels > SAFE_CANVAS_HEIGHT) {
-        const scale = SAFE_CANVAS_HEIGHT / estimatedPixels;
-        
-        // Use transform: scale for better reliability over documentElement.style.zoom
-        document.body.style.transform = `scale(${scale})`;
-        document.body.style.transformOrigin = 'top left';
-        document.body.style.width = `${100 / scale}%`; // Adjust body width to keep scrollbar correct
-        
-        console.log(`[Auto Zoom] Applying transform scale: ${scale.toFixed(3)} to prevent exceeding GPU limit`);
-      } else {
-        console.log(`[Auto Zoom] No zoom needed (estimated ${estimatedPixels}px)`);
+      const pre=await preScrollAndStabilize(scrollEl,{stabilizeRounds:2,waitPerStepMs:550});
+      console.log("[preScroll] Final height:",pre.finalHeight,"positions:",pre.positions.length);
+
+      const dataUrls=[];
+      for(let i=0;i<pre.positions.length;i++){
+        const y=pre.positions[i];
+        scrollEl.scrollTo({top:y,left:0,behavior:"instant"});
+        await new Promise(r=>requestAnimationFrame(()=>setTimeout(r,420)));
+        const d=await safeCapture();
+        dataUrls.push(d);
       }
 
-      // === Pre-scroll to stabilize content ===
-      const pre = await preScrollAndStabilize(scrollEl, { stabilizeRounds: 2, waitPerStepMs: 550 });
-      console.log('[preScroll] Final height:', pre.finalHeight, 'Positions:', pre.positions.length);
+      const imgs=[];
+      for(const d of dataUrls){ const img=await loadImage(d); imgs.push({img,width:img.width,height:img.height}); }
 
-      // === Capture each position ===
-      const capturedDataUrls = [];
-      for (let i = 0; i < pre.positions.length; i++) {
-        const y = pre.positions[i];
-        try { scrollEl.scrollTo({ top: y, left: 0, behavior: 'instant' }); } catch {}
-        
-        // Increased delay slightly for stability after scroll and zoom adjustment
-        await new Promise(r => requestAnimationFrame(() => setTimeout(r, 600))); 
-        
-        const dataUrl = await safeCapture();
-        capturedDataUrls.push(dataUrl);
+      const stitched=await stitchAndExportBlobs(imgs);
+
+      if(stitched.length===1 && stitched[0].mime==="image/png" && stitched[0].blob.size<=MAX_BYTES){
+        const name=`${(new URL(location.href)).hostname.replace(/\./g,"_")}_fullpage.png`;
+        downloadBlob(stitched[0].blob,name); alert("Saved PNG (under limit)."); return;
+      }
+      if(stitched.length===1 && stitched[0].mime.includes("webp") && stitched[0].blob.size<=MAX_BYTES){
+        const name=`${(new URL(location.href)).hostname.replace(/\./g,"_")}_fullpage.webp`;
+        downloadBlob(stitched[0].blob,name); alert("Saved WebP (single file)."); return;
       }
 
-      // === Load images ===
-      const images = [];
-      for (const d of capturedDataUrls) {
-        const img = await loadImage(d);
-        images.push({ img, width: img.width, height: img.height });
-      }
-
-      // === Stitch & Export ===
-      const stitched = await stitchAndExportBlobs(images);
-
-      if (stitched.length === 1 && stitched[0].mime === 'image/png' && stitched[0].blob.size <= MAX_BYTES) {
-        const name = `${(new URL(location.href)).hostname.replace(/\./g,'_')}_fullpage.png`;
-        downloadBlob(stitched[0].blob, name);
-        alert('Saved PNG (under limit).');
-        return;
-      }
-
-      if (stitched.length === 1 && stitched[0].mime.includes('webp') && stitched[0].blob.size <= MAX_BYTES) {
-        const name = `${(new URL(location.href)).hostname.replace(/\./g,'_')}_fullpage.webp`;
-        downloadBlob(stitched[0].blob, name);
-        alert('Saved WebP (single file).');
-        return;
-      }
-
-      const parts = await splitIntoSizedWebPs(images);
-      for (let i = 0; i < parts.length; i++) {
-        const p = parts[i];
-        const ext = (p.mime && p.mime.includes('webp')) ? 'webp' : 'png';
-        const fname = `${(new URL(location.href)).hostname.replace(/\./g,'_')}_part${i+1}.${ext}`;
-        downloadBlob(p.blob, fname);
+      const parts=await splitIntoSizedWebPs(imgs);
+      for(let i=0;i<parts.length;i++){
+        const p=parts[i];
+        const ext=p.mime.includes("webp")?"webp":"png";
+        const name=`${(new URL(location.href)).hostname.replace(/\./g,"_")}_part${i+1}.${ext}`;
+        downloadBlob(p.blob,name);
       }
       alert(`Saved ${parts.length} image(s).`);
-    } finally {
-      // --- Restoration ---
-      try { scrollEl.style.overflow = originalOverflow; } catch {}
-      try { scrollEl.scrollTo({ top: originalScroll, left: 0, behavior: 'instant' }); } catch {}
-      
-      // Restore original zoom and transform styles
+    }finally{
+      scrollEl.style.overflow=origOverflow;
+      scrollEl.scrollTo({top:origScroll,left:0,behavior:"instant"});
       document.documentElement.style.zoom = origZoom;
-      document.body.style.transform = origTransform;
-      document.body.style.transformOrigin = origTransformOrigin;
-      document.body.style.width = origBodyWidth;
     }
   }
 })();
