@@ -1,8 +1,9 @@
 // contentScript.js
 // Scroll + capture + adaptive format logic:
 // - Save as PNG if total <= 19MB
-// - Else try single WebP (q=0.92)
-// - If WebP still >19MB, split into multiple WebPs ≤19MB each
+// - Else try WebP at q=0.97 (sharp)
+// - If WebP >19MB, retry at q=0.92
+// - If still >19MB, split into multiple WebPs ≤19MB each
 
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
@@ -13,8 +14,8 @@
   const CAPTURE_DELAY_MS = 550;
   const CAPTURE_MAX_RETRIES = 3;
   const CAPTURE_RETRY_BASE_DELAY = 300;
-  const WEBP_QUALITY = 0.92;
-  const ZOOM_FACTOR = 0.8; // <-- set desired zoom here (0.8 = 80%)
+  const WEBP_QUALITY_HIGH = 0.97; // default sharp WebP
+  const WEBP_QUALITY_FALLBACK = 0.92; // fallback for large WebP
   // ------------------------
 
   let lastCaptureTs = 0;
@@ -86,139 +87,132 @@
     const scrollingEl = document.scrollingElement || document.documentElement;
     const originalOverflow = scrollingEl.style.overflow;
     const originalScrollTop = scrollingEl.scrollTop;
-    const originalZoom = document.documentElement.style.zoom || '';
 
-    // apply zoom BEFORE measuring/layout so captures reflect zoomed view
-    try {
-      document.documentElement.style.zoom = String(ZOOM_FACTOR);
+    const totalWidth = Math.max(document.documentElement.scrollWidth, document.body.scrollWidth);
+    const totalHeight = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
+    const viewportHeight = window.innerHeight;
 
-      // let layout reflow after zoom
-      await new Promise(r => setTimeout(r, 120));
+    // Hide fixed/sticky elements
+    const fixedEls = Array.from(document.querySelectorAll('*')).filter(el => {
+      const s = getComputedStyle(el);
+      return (s.position === 'fixed' || s.position === 'sticky') &&
+             s.display !== 'none' &&
+             el.offsetParent !== null;
+    });
+    const fixedCache = fixedEls.map(el => ({
+      el,
+      orig: { visibility: el.style.visibility, pointerEvents: el.style.pointerEvents }
+    }));
+    fixedEls.forEach(el => { el.style.visibility = 'hidden'; el.style.pointerEvents = 'none'; });
 
-      const totalWidth = Math.max(document.documentElement.scrollWidth, document.body.scrollWidth);
-      const totalHeight = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
-      const viewportHeight = window.innerHeight;
+    scrollingEl.style.overflow = 'hidden';
 
-      // Hide fixed/sticky elements
-      const fixedEls = Array.from(document.querySelectorAll('*')).filter(el => {
-        const s = getComputedStyle(el);
-        return (s.position === 'fixed' || s.position === 'sticky') &&
-               s.display !== 'none' &&
-               el.offsetParent !== null;
-      });
-      const fixedCache = fixedEls.map(el => ({
-        el,
-        orig: { visibility: el.style.visibility, pointerEvents: el.style.pointerEvents }
-      }));
-      fixedEls.forEach(el => { el.style.visibility = 'hidden'; el.style.pointerEvents = 'none'; });
+    const positions = [];
+    for (let y = 0; y < totalHeight; y += viewportHeight) {
+      positions.push(Math.min(y, totalHeight - viewportHeight));
+      if (y + viewportHeight >= totalHeight) break;
+    }
 
-      scrollingEl.style.overflow = 'hidden';
+    const capturedDataUrls = [];
+    for (const y of positions) {
+      scrollingEl.scrollTo({ top: y, left: 0, behavior: 'instant' });
+      await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS));
+      const dataUrl = await safeCapture();
+      capturedDataUrls.push(dataUrl);
+    }
 
-      const positions = [];
-      for (let y = 0; y < totalHeight; y += viewportHeight) {
-        positions.push(Math.min(y, totalHeight - viewportHeight));
-        if (y + viewportHeight >= totalHeight) break;
+    // restore
+    scrollingEl.scrollTo({ top: originalScrollTop, left: 0, behavior: 'instant' });
+    scrollingEl.style.overflow = originalOverflow;
+    fixedCache.forEach(it => {
+      it.el.style.visibility = it.orig.visibility || '';
+      it.el.style.pointerEvents = it.orig.pointerEvents || '';
+    });
+
+    // Load all captures as images
+    const images = [];
+    for (const d of capturedDataUrls) {
+      const img = await loadImage(d);
+      images.push({ img, width: img.width, height: img.height });
+    }
+
+    // helper: stitch vertically
+    async function stitchImages(imgItems, mime = 'image/png', quality = 0.92) {
+      const w = Math.max(...imgItems.map(i => i.width));
+      const h = imgItems.reduce((s, i) => s + i.height, 0);
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      let y = 0;
+      for (const it of imgItems) {
+        ctx.drawImage(it.img, 0, y, it.width, it.height);
+        y += it.height;
       }
+      const blob = await canvasToBlob(canvas, mime, quality);
+      return { blob, width: w, height: h, mime };
+    }
 
-      const capturedDataUrls = [];
-      for (const y of positions) {
-        scrollingEl.scrollTo({ top: y, left: 0, behavior: 'instant' });
-        await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS));
-        const dataUrl = await safeCapture();
-        capturedDataUrls.push(dataUrl);
-      }
+    // 1️⃣ Try to make one big PNG
+    const { blob: pngBlob } = await stitchImages(images, 'image/png');
+    if (pngBlob.size <= MAX_BYTES) {
+      saveBlob(pngBlob, 'png');
+      alert('Saved as PNG (under 19MB)');
+      return;
+    }
 
-      // restore scroll/overflow/fixed elements BEFORE stitching so DOM returns to normal
-      scrollingEl.scrollTo({ top: originalScrollTop, left: 0, behavior: 'instant' });
-      scrollingEl.style.overflow = originalOverflow;
-      fixedCache.forEach(it => {
-        it.el.style.visibility = it.orig.visibility || '';
-        it.el.style.pointerEvents = it.orig.pointerEvents || '';
-      });
+    // 2️⃣ Try one WebP at high quality (0.97)
+    let { blob: webpBlob } = await stitchImages(images, 'image/webp', WEBP_QUALITY_HIGH);
+    if (webpBlob.size <= MAX_BYTES) {
+      saveBlob(webpBlob, 'webp');
+      alert('Saved as WebP (quality 0.97)');
+      return;
+    }
 
-      // restore zoom now (important before further DOM operations)
-      document.documentElement.style.zoom = originalZoom;
+    // 3️⃣ If still >19MB, retry with lower quality (0.92)
+    console.log(`WebP(0.97) was ${Math.round(webpBlob.size / 1024 / 1024)}MB, retrying at 0.92...`);
+    const retry = await stitchImages(images, 'image/webp', WEBP_QUALITY_FALLBACK);
+    webpBlob = retry.blob;
 
-      // Load all captures as images
-      const images = [];
-      for (const d of capturedDataUrls) {
-        const img = await loadImage(d);
-        images.push({ img, width: img.width, height: img.height });
-      }
+    if (webpBlob.size <= MAX_BYTES) {
+      saveBlob(webpBlob, 'webp');
+      alert('Saved as WebP (quality 0.92, reduced for size)');
+      return;
+    }
 
-      // helper: stitch vertically
-      async function stitchImages(imgItems, mime = 'image/png', quality = 0.92) {
-        const w = Math.max(...imgItems.map(i => i.width));
-        const h = imgItems.reduce((s, i) => s + i.height, 0);
-        const canvas = document.createElement('canvas');
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext('2d');
-        let y = 0;
-        for (const it of imgItems) {
-          ctx.drawImage(it.img, 0, y, it.width, it.height);
-          y += it.height;
+    // 4️⃣ Split into smaller WebPs ≤19MB each
+    const batches = [];
+    let currentBatch = [];
+    for (let i = 0; i < images.length; i++) {
+      const candidate = images[i];
+      const tryBatch = currentBatch.concat([candidate]);
+      const { blob: testBlob } = await stitchImages(tryBatch, 'image/webp', WEBP_QUALITY_FALLBACK);
+      if (testBlob.size <= MAX_BYTES) {
+        currentBatch = tryBatch;
+      } else {
+        if (currentBatch.length > 0) {
+          const { blob } = await stitchImages(currentBatch, 'image/webp', WEBP_QUALITY_FALLBACK);
+          batches.push(blob);
         }
-        const blob = await canvasToBlob(canvas, mime, quality);
-        return { blob, width: w, height: h, mime };
+        currentBatch = [candidate];
       }
+    }
+    if (currentBatch.length > 0) {
+      const { blob } = await stitchImages(currentBatch, 'image/webp', WEBP_QUALITY_FALLBACK);
+      batches.push(blob);
+    }
 
-      // 1️⃣ Try to make one big PNG
-      const { blob: pngBlob } = await stitchImages(images, 'image/png');
-      if (pngBlob.size <= MAX_BYTES) {
-        saveBlob(pngBlob, 'png');
-        alert('Saved as PNG (under 19MB)');
-        return;
-      }
+    for (let i = 0; i < batches.length; i++) {
+      saveBlob(batches[i], 'webp', i + 1);
+    }
 
-      // 2️⃣ Try one WebP instead (same full page)
-      const { blob: webpBlob } = await stitchImages(images, 'image/webp', WEBP_QUALITY);
-      if (webpBlob.size <= MAX_BYTES) {
-        saveBlob(webpBlob, 'webp');
-        alert('Saved as single WebP (PNG was >19MB)');
-        return;
-      }
+    alert(`Saved as ${batches.length} WebP image(s) (each ≤19MB)`);
 
-      // 3️⃣ Split into smaller WebPs ≤19MB
-      const batches = [];
-      let currentBatch = [];
-      for (let i = 0; i < images.length; i++) {
-        const candidate = images[i];
-        const tryBatch = currentBatch.concat([candidate]);
-        const { blob: testBlob } = await stitchImages(tryBatch, 'image/webp', WEBP_QUALITY);
-        if (testBlob.size <= MAX_BYTES) {
-          currentBatch = tryBatch;
-        } else {
-          // finalize previous
-          if (currentBatch.length > 0) {
-            const { blob } = await stitchImages(currentBatch, 'image/webp', WEBP_QUALITY);
-            batches.push(blob);
-          }
-          currentBatch = [candidate];
-        }
-      }
-      if (currentBatch.length > 0) {
-        const { blob } = await stitchImages(currentBatch, 'image/webp', WEBP_QUALITY);
-        batches.push(blob);
-      }
-
-      for (let i = 0; i < batches.length; i++) {
-        saveBlob(batches[i], 'webp', i + 1);
-      }
-
-      alert(`Saved as ${batches.length} WebP image(s) (each ≤19MB)`);
-
-      // save helper
-      function saveBlob(blob, ext, index = 0) {
-        const base = (new URL(location.href)).hostname.replace(/\./g, '_');
-        const name = index ? `${base}_part${index}.${ext}` : `${base}_fullpage.${ext}`;
-        downloadBlob(blob, name);
-      }
-    } catch (err) {
-      // ensure cleanup on error
-      try { document.documentElement.style.zoom = originalZoom; } catch(e) {}
-      try { scrollingEl.style.overflow = originalOverflow; } catch(e) {}
-      throw err;
+    // save helper
+    function saveBlob(blob, ext, index = 0) {
+      const base = (new URL(location.href)).hostname.replace(/\./g, '_');
+      const name = index ? `${base}_part${index}.${ext}` : `${base}_fullpage.${ext}`;
+      downloadBlob(blob, name);
     }
   }
 })();
