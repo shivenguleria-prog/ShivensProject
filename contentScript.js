@@ -1,5 +1,11 @@
 // contentScript.js
-// Fullpage capture with zoom, PNG-first, dual-WebP, precise scrolling and overlap minimization.
+// Fullpage capture with:
+// - Zoom-out (restore after)
+// - PNG-first, WebP primary (0.97) then fallback (0.92)
+// - Precise scrolling to cover page without repeated bottom frames
+// - Wait-for-scroll-and-stability + duplicate-detection to avoid repeated footer
+// - Overlap-aware stitching (row-hash) to minimize overlaps
+// - Batching to keep each final file ≤ 19MB when possible
 
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
@@ -7,20 +13,26 @@
 
   // ---- Configuration ----
   const MAX_BYTES = 19 * 1024 * 1024; // 19 MB
-  const CAPTURE_DELAY_MS = 550;
+  const CAPTURE_DELAY_MS = 550; // delay between scroll and capturing visible
   const CAPTURE_MAX_RETRIES = 3;
   const CAPTURE_RETRY_BASE_DELAY = 300;
   const WEBP_QUALITY_PRIMARY = 0.97;
   const WEBP_QUALITY_FALLBACK = 0.92;
-  const PNG_QUALITY = 0.92; // PNG ignores quality mostly, kept param
+  const PNG_QUALITY = 0.92; // not used by PNG usually
   const ZOOM_FACTOR = 0.8; // 80% zoom
-  const ROW_HASH_MOD = 4294967291; // large prime for simple hash reduce
-  const MAX_OVERLAP_CHECK = 800; // maximum rows to consider for overlap (cap for perf)
-  const ROW_DIFF_TOLERANCE = 0; // exact row match required (set >0 to allow small diffs)
+  const MAX_OVERLAP_CHECK = 800; // max rows to check for overlap to limit CPU
+  const ROW_DIFF_TOLERANCE = 0; // exact row-match required; increase to allow small diffs
+  const STABILITY_TIMEOUT_MS = 2500;
+  const STABILITY_POLL_INTERVAL = 80;
+  const STABILITY_STABLE_CHECKS = 3;
+  const STABILITY_STABLE_DELAY = 120;
+  const DUPLICATE_SAMPLE_STEP = 6; // sample every 6th pixel for duplicate test
+  const DUPLICATE_PIXEL_TOL = 2; // per-channel tolerance for duplicate test
   // ------------------------
 
   let lastCaptureTs = 0;
 
+  // listen for start-capture message
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg && msg.action === 'start-capture') {
       startCapture().catch(e => {
@@ -81,7 +93,71 @@
     URL.revokeObjectURL(url);
   }
 
-  // Compute per-row hash array for an Image object
+  // Wait until window.scrollY ~ targetY and scrollHeight stabilizes
+  async function waitForScrollAndStability(targetY, opts = {}) {
+    const timeoutMs = opts.timeoutMs ?? STABILITY_TIMEOUT_MS;
+    const pollInterval = opts.pollInterval ?? STABILITY_POLL_INTERVAL;
+    const yTol = opts.yTol ?? 1;
+    const stableChecks = opts.stableChecks ?? STABILITY_STABLE_CHECKS;
+    const stableDelay = opts.stableDelay ?? STABILITY_STABLE_DELAY;
+
+    const start = Date.now();
+    while (Math.abs(window.scrollY - targetY) > yTol && (Date.now() - start) < timeoutMs) {
+      await new Promise(r => setTimeout(r, pollInterval));
+    }
+
+    let lastH = document.documentElement.scrollHeight;
+    let stableCount = 0;
+    while (stableCount < stableChecks && (Date.now() - start) < timeoutMs) {
+      await new Promise(r => setTimeout(r, stableDelay));
+      const h = document.documentElement.scrollHeight;
+      if (h === lastH) stableCount++;
+      else {
+        stableCount = 0;
+        lastH = h;
+      }
+    }
+    // small extra pause for lazy images to render
+    await new Promise(r => setTimeout(r, 80));
+  }
+
+  // Compare two dataURLs approximately by sampling pixels
+  async function imagesIdentical(dataUrlA, dataUrlB, opts = {}) {
+    const pixelTolerance = opts.pixelTolerance ?? DUPLICATE_PIXEL_TOL;
+    const sampleStep = opts.sampleStep ?? DUPLICATE_SAMPLE_STEP;
+
+    if (!dataUrlA || !dataUrlB) return false;
+    if (dataUrlA === dataUrlB) return true;
+
+    const [imgA, imgB] = await Promise.all([loadImage(dataUrlA), loadImage(dataUrlB)]);
+    if (imgA.width !== imgB.width || imgA.height !== imgB.height) return false;
+
+    const w = imgA.width, h = imgA.height;
+    const cA = document.createElement('canvas'); cA.width = w; cA.height = h;
+    const cB = document.createElement('canvas'); cB.width = w; cB.height = h;
+    const ctxA = cA.getContext('2d'), ctxB = cB.getContext('2d');
+    ctxA.drawImage(imgA, 0, 0, w, h);
+    ctxB.drawImage(imgB, 0, 0, w, h);
+
+    const dA = ctxA.getImageData(0, 0, w, h).data;
+    const dB = ctxB.getImageData(0, 0, w, h).data;
+
+    for (let y = 0; y < h; y += sampleStep) {
+      for (let x = 0; x < w; x += sampleStep) {
+        const idx = (y * w + x) * 4;
+        const dr = Math.abs(dA[idx]   - dB[idx]);
+        const dg = Math.abs(dA[idx+1] - dB[idx+1]);
+        const db = Math.abs(dA[idx+2] - dB[idx+2]);
+        const da = Math.abs(dA[idx+3] - dB[idx+3]);
+        if (dr > pixelTolerance || dg > pixelTolerance || db > pixelTolerance || da > pixelTolerance) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // Compute per-row hashes for an Image (used to detect overlap). Returns { width, height, rowHashes, img }
   async function computeRowHashes(img) {
     const w = img.width;
     const h = img.height;
@@ -93,44 +169,36 @@
     const data = ctx.getImageData(0, 0, w, h).data;
 
     const rowHashes = new Uint32Array(h);
-    // compute a simple rolling hash per row
     for (let row = 0; row < h; row++) {
-      let hash = 2166136261 >>> 0; // FNV offset basis (32-bit)
+      let hash = 2166136261 >>> 0; // FNV-1a 32-bit init
       const baseIndex = row * w * 4;
       for (let x = 0; x < w; x++) {
-        // read RGBA
-        const r = data[baseIndex + x * 4];
-        const g = data[baseIndex + x * 4 + 1];
-        const b = data[baseIndex + x * 4 + 2];
-        const a = data[baseIndex + x * 4 + 3];
-        // fold pixels into hash
-        hash ^= r; hash = Math.imul(hash, 16777619) >>> 0;
-        hash ^= g; hash = Math.imul(hash, 16777619) >>> 0;
-        hash ^= b; hash = Math.imul(hash, 16777619) >>> 0;
-        hash ^= a; hash = Math.imul(hash, 16777619) >>> 0;
+        hash ^= data[baseIndex + x * 4];
+        hash = Math.imul(hash, 16777619) >>> 0;
+        hash ^= data[baseIndex + x * 4 + 1];
+        hash = Math.imul(hash, 16777619) >>> 0;
+        hash ^= data[baseIndex + x * 4 + 2];
+        hash = Math.imul(hash, 16777619) >>> 0;
+        hash ^= data[baseIndex + x * 4 + 3];
+        hash = Math.imul(hash, 16777619) >>> 0;
       }
       rowHashes[row] = hash;
     }
     return { width: w, height: h, rowHashes, img };
   }
 
-  // Determine vertical overlap (rows) between top of b and bottom of a
-  // returns number of overlapping rows (0..maxPossible)
+  // Find vertical overlap (rows) between end of aHashes and start of bHashes. Returns overlap row-count.
   function findVerticalOverlap(aHashes, bHashes, maxCheck) {
-    // aHashes, bHashes are Uint32Array of per-row hashes
     const aH = aHashes.length;
     const bH = bHashes.length;
     const maxPossible = Math.min(maxCheck, aH, bH);
     if (maxPossible <= 0) return 0;
 
-    // We'll look for the largest overlap, scanning from maxPossible down to 1.
-    // For each candidate overlap 'o', check if the last 'o' rows of A match first 'o' rows of B.
     for (let o = maxPossible; o >= 1; o--) {
       let ok = true;
       const aStart = aH - o;
-      const bStart = 0;
       for (let r = 0; r < o; r++) {
-        if (Math.abs(aHashes[aStart + r] - bHashes[bStart + r]) > ROW_DIFF_TOLERANCE) {
+        if (Math.abs(aHashes[aStart + r] - bHashes[r]) > ROW_DIFF_TOLERANCE) {
           ok = false;
           break;
         }
@@ -152,14 +220,14 @@
     try {
       // apply zoom before measuring/layout
       document.documentElement.style.zoom = String(ZOOM_FACTOR);
-      await new Promise(r => setTimeout(r, 160)); // allow layout reflow
+      await new Promise(r => setTimeout(r, 160)); // allow reflow
 
-      // measure after zoom
+      // measure after zoom applied
       const totalWidth = Math.max(document.documentElement.scrollWidth, document.body.scrollWidth);
       const totalHeight = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
-      const viewportHeight = window.innerHeight;
+      const viewportHeight = Math.max(window.innerHeight, document.documentElement.clientHeight);
 
-      // Hide fixed/sticky elements
+      // hide fixed/sticky elements
       const fixedEls = Array.from(document.querySelectorAll('*')).filter(el => {
         const s = getComputedStyle(el);
         return (s.position === 'fixed' || s.position === 'sticky') &&
@@ -174,25 +242,79 @@
 
       scrollingEl.style.overflow = 'hidden';
 
-      // Precise positions: cover the page with no overlapping repeats; final position exactly at bottom
+      // precise positions: iterate viewportHeight steps, final position exactly bottom
       const positions = [];
-      let y = 0;
-      while (y < totalHeight - viewportHeight) {
-        positions.push(Math.round(y));
-        y += viewportHeight;
+      let yPos = 0;
+      while (yPos < totalHeight - viewportHeight) {
+        positions.push(Math.round(yPos));
+        yPos += viewportHeight;
       }
-      positions.push(Math.max(0, Math.round(totalHeight - viewportHeight))); // ensure final bottom
+      positions.push(Math.max(0, Math.round(totalHeight - viewportHeight)));
 
-      // capture each viewport position
+      // capture loop with stability + duplicate detection + nudge retry
       const capturedDataUrls = [];
-      for (const pos of positions) {
-        scrollingEl.scrollTo({ top: pos, left: 0, behavior: 'instant' });
-        await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS));
-        const dataUrl = await safeCapture();
+      let prevDataUrl = null;
+
+      for (let i = 0; i < positions.length; i++) {
+        const pos = positions[i];
+        window.scrollTo({ top: pos, left: 0, behavior: 'instant' });
+
+        // wait for scroll & layout stability
+        await waitForScrollAndStability(pos, { timeoutMs: STABILITY_TIMEOUT_MS });
+
+        // capture
+        let dataUrl = await safeCapture();
+
+        // duplicate detection
+        let identical = false;
+        if (prevDataUrl) {
+          try {
+            identical = await imagesIdentical(prevDataUrl, dataUrl, { pixelTolerance: DUPLICATE_PIXEL_TOL, sampleStep: DUPLICATE_SAMPLE_STEP });
+          } catch (e) {
+            console.warn('imagesIdentical error', e);
+            identical = false;
+          }
+        }
+
+        let nudgeAttempts = 0;
+        while (identical && nudgeAttempts < 2) {
+          nudgeAttempts++;
+          // try tiny nudge: scroll 1px down, wait, capture, compare
+          window.scrollBy(0, 1);
+          await waitForScrollAndStability(window.scrollY, { timeoutMs: 600 });
+          await new Promise(r => setTimeout(r, 120));
+          dataUrl = await safeCapture();
+          try {
+            identical = await imagesIdentical(prevDataUrl, dataUrl, { pixelTolerance: DUPLICATE_PIXEL_TOL, sampleStep: DUPLICATE_SAMPLE_STEP });
+          } catch (e) {
+            identical = false;
+          }
+          if (!identical) break;
+          // nudge back up and try again
+          window.scrollBy(0, -1);
+          await waitForScrollAndStability(window.scrollY, { timeoutMs: 600 });
+          await new Promise(r => setTimeout(r, 120));
+          dataUrl = await safeCapture();
+          try {
+            identical = await imagesIdentical(prevDataUrl, dataUrl, { pixelTolerance: DUPLICATE_PIXEL_TOL, sampleStep: DUPLICATE_SAMPLE_STEP });
+          } catch (e) {
+            identical = false;
+          }
+        }
+
+        if (identical) {
+          console.warn(`Skipping duplicate capture at pos ${pos} (index ${i}).`);
+          // If it's the last frame, break loop to avoid endless attempts
+          if (i === positions.length - 1) break;
+          else continue;
+        }
+
+        // accept capture
         capturedDataUrls.push(dataUrl);
+        prevDataUrl = dataUrl;
       }
 
-      // restore scroll/overflow/fixed elements BEFORE stitching
+      // restore scroll/overflow/fixed elements before heavy DOM ops
       scrollingEl.scrollTo({ top: originalScrollTop, left: 0, behavior: 'instant' });
       scrollingEl.style.overflow = originalOverflow;
       fixedCache.forEach(it => {
@@ -203,102 +325,92 @@
       // restore zoom
       document.documentElement.style.zoom = originalZoom;
 
-      // load images and compute per-row hashes (used for overlap detection)
+      // load images and compute row hashes
       const loaded = [];
       for (let i = 0; i < capturedDataUrls.length; i++) {
-        const d = capturedDataUrls[i];
-        const img = await loadImage(d);
-        // For large captures this can be heavy; but we limit overlap checks later
-        const meta = await computeRowHashes(img);
+        const img = await loadImage(capturedDataUrls[i]);
+        const meta = await computeRowHashes(img); // may be heavy for big captures
         loaded.push(meta);
       }
 
-      // detect vertical overlaps between consecutive images
-      const overlaps = []; // overlaps[i] = number of rows overlapped between loaded[i] and loaded[i+1]
+      if (loaded.length === 0) {
+        throw new Error('No captures were produced.');
+      }
+
+      // compute overlaps between consecutive images
+      const overlaps = [];
       for (let i = 0; i < loaded.length - 1; i++) {
         const a = loaded[i];
         const b = loaded[i + 1];
-        // choose reasonable max check: min(height/2, MAX_OVERLAP_CHECK)
         const maxCheck = Math.min(Math.floor(a.height / 2), Math.floor(b.height / 2), MAX_OVERLAP_CHECK);
         const o = findVerticalOverlap(a.rowHashes, b.rowHashes, maxCheck);
         overlaps.push(o);
       }
 
-      // Stitch images vertically while removing overlaps
-      // Calculate final stitched height
+      // produce stitched canvas (removing overlaps)
       let stitchedWidth = 0;
       let stitchedHeight = 0;
       for (let i = 0; i < loaded.length; i++) {
         stitchedWidth = Math.max(stitchedWidth, loaded[i].width);
         stitchedHeight += loaded[i].height;
-        if (i < overlaps.length) stitchedHeight -= overlaps[i]; // subtract overlapped rows
+        if (i < overlaps.length) stitchedHeight -= overlaps[i];
       }
 
-      // create canvas and draw with offsets adjusted for overlaps
       const canvas = document.createElement('canvas');
       canvas.width = stitchedWidth;
       canvas.height = stitchedHeight;
       const ctx = canvas.getContext('2d');
 
-      let yOffset = 0;
+      let yOff = 0;
       for (let i = 0; i < loaded.length; i++) {
         const meta = loaded[i];
-        // If overlap with previous exists, we draw skipping the top 'overlapPrev' rows of this image
-        let skipTop = 0;
-        if (i > 0) {
-          skipTop = overlaps[i - 1] || 0;
-        }
+        const skipTop = (i > 0) ? (overlaps[i - 1] || 0) : 0;
         if (skipTop === 0) {
-          ctx.drawImage(meta.img, 0, 0, meta.width, meta.height, 0, yOffset, meta.width, meta.height);
-          yOffset += meta.height;
+          ctx.drawImage(meta.img, 0, 0, meta.width, meta.height, 0, yOff, meta.width, meta.height);
+          yOff += meta.height;
         } else {
-          // draw only the portion from skipTop..height
           const srcY = skipTop;
           const srcH = meta.height - skipTop;
-          ctx.drawImage(meta.img, 0, srcY, meta.width, srcH, 0, yOffset, meta.width, srcH);
-          yOffset += srcH;
+          ctx.drawImage(meta.img, 0, srcY, meta.width, srcH, 0, yOff, meta.width, srcH);
+          yOff += srcH;
         }
       }
 
-      // Helper to attempt and save with given mime/quality
-      async function trySave(mime, quality) {
-        const blob = await canvasToBlob(canvas, mime, quality);
-        return blob;
+      // helper to try saving canvas as blob
+      async function trySaveCanvas(mime, quality) {
+        return await canvasToBlob(canvas, mime, quality);
       }
 
-      // 1) Try PNG full
-      const pngBlob = await trySave('image/png', PNG_QUALITY);
+      // Try PNG first
+      const pngBlob = await trySaveCanvas('image/png', PNG_QUALITY);
       if (pngBlob.size <= MAX_BYTES) {
         saveBlob(pngBlob, 'png');
         alert('Saved as PNG (under 19MB)');
         return;
       }
 
-      // 2) Try WebP primary
-      let webpPrimary = await trySave('image/webp', WEBP_QUALITY_PRIMARY);
+      // Try WebP primary
+      let webpPrimary = await trySaveCanvas('image/webp', WEBP_QUALITY_PRIMARY);
       if (webpPrimary.size <= MAX_BYTES) {
         saveBlob(webpPrimary, 'webp');
         alert('Saved as single WebP (quality ' + WEBP_QUALITY_PRIMARY + ')');
         return;
       }
 
-      // 3) Try WebP fallback
-      let webpFallback = await trySave('image/webp', WEBP_QUALITY_FALLBACK);
+      // Try WebP fallback
+      let webpFallback = await trySaveCanvas('image/webp', WEBP_QUALITY_FALLBACK);
       if (webpFallback.size <= MAX_BYTES) {
         saveBlob(webpFallback, 'webp');
         alert('Saved as single WebP (quality ' + WEBP_QUALITY_FALLBACK + ')');
         return;
       }
 
-      // 4) If still too big, split into batches intelligently using overlap-aware stitching per batch
-      // We'll build batches of consecutive captured frames grouping until the stitched webp at primary is > MAX_BYTES,
-      // then finalize the previous group. For each final group we will try primary then fallback.
+      // If still too big, build batches using overlap-aware range stitching
       const batches = [];
       let batchStart = 0;
 
-      // helper to produce a stitched blob for a range [s,e] inclusive using same approach above
+      // helper to stitch a range [s..e] inclusive into a blob
       async function stitchRangeToBlob(s, e, mime, quality) {
-        // determine stitched width/height for this range using precomputed overlaps
         let w = 0, h = 0;
         for (let k = s; k <= e; k++) {
           w = Math.max(w, loaded[k].width);
@@ -309,49 +421,46 @@
         c.width = w;
         c.height = h;
         const cctx = c.getContext('2d');
-        let yOff = 0;
+        let y0 = 0;
         for (let k = s; k <= e; k++) {
           const meta = loaded[k];
-          const skipTop = (k > s) ? (overlaps[k - 1] || 0) : 0;
-          if (skipTop === 0) {
-            cctx.drawImage(meta.img, 0, 0, meta.width, meta.height, 0, yOff, meta.width, meta.height);
-            yOff += meta.height;
+          const skip = (k > s) ? (overlaps[k - 1] || 0) : 0;
+          if (skip === 0) {
+            cctx.drawImage(meta.img, 0, 0, meta.width, meta.height, 0, y0, meta.width, meta.height);
+            y0 += meta.height;
           } else {
-            const srcY = skipTop;
-            const srcH = meta.height - skipTop;
-            cctx.drawImage(meta.img, 0, srcY, meta.width, srcH, 0, yOff, meta.width, srcH);
-            yOff += srcH;
+            const srcY = skip;
+            const srcH = meta.height - skip;
+            cctx.drawImage(meta.img, 0, srcY, meta.width, srcH, 0, y0, meta.width, srcH);
+            y0 += srcH;
           }
         }
         const blob = await canvasToBlob(c, mime, quality);
         return blob;
       }
 
-      // Build batches
+      // grow batches greedily until test blob exceeds MAX_BYTES
       for (let i = 0; i < loaded.length; i++) {
-        // attempt to grow a batch from batchStart..i
         const testBlob = await stitchRangeToBlob(batchStart, i, 'image/webp', WEBP_QUALITY_PRIMARY);
         if (testBlob.size <= MAX_BYTES) {
-          // still fits — continue to next
           if (i === loaded.length - 1) {
-            // last one fits too, finalize
-            batches.push({ s: batchStart, e: i, preferred: 'primary' });
-          }
-          continue;
-        } else {
-          // testBlob > MAX_BYTES — we must finalize the previous batch batchStart..i-1 (if any)
-          if (i - 1 >= batchStart) {
-            batches.push({ s: batchStart, e: i - 1, preferred: 'primary' });
-            batchStart = i; // new batch starting at i
+            batches.push({ s: batchStart, e: i });
           } else {
-            // single capture at i already too big at primary — finalize it (we'll try fallback when saving)
-            batches.push({ s: i, e: i, preferred: 'primary' });
+            continue; // grow batch
+          }
+        } else {
+          if (i - 1 >= batchStart) {
+            batches.push({ s: batchStart, e: i - 1 });
+            batchStart = i;
+          } else {
+            // single element too large even alone at primary -> finalize single
+            batches.push({ s: i, e: i });
             batchStart = i + 1;
           }
         }
       }
 
-      // Save batches (try primary quality blob first; if > MAX_BYTES, try fallback; if still >MAX_BYTES, save fallback anyway)
+      // save batches (try primary -> fallback)
       for (let bi = 0; bi < batches.length; bi++) {
         const { s, e } = batches[bi];
         const blobPrimary = await stitchRangeToBlob(s, e, 'image/webp', WEBP_QUALITY_PRIMARY);
@@ -364,15 +473,13 @@
           saveBlob(blobFallback, 'webp', bi + 1);
           continue;
         }
-        // still too big — save fallback and warn
+        // still too big — save fallback anyway and warn
         saveBlob(blobFallback, 'webp', bi + 1);
         console.warn(`Saved batch ${bi + 1} at fallback quality but size still > ${MAX_BYTES}.`);
       }
 
       alert(`Saved ${batches.length} WebP file(s) after batching (tried ${WEBP_QUALITY_PRIMARY} then ${WEBP_QUALITY_FALLBACK})`);
-
     } catch (err) {
-      // cleanup on error
       try { document.documentElement.style.zoom = originalZoom; } catch (e) {}
       try { scrollingEl.style.overflow = originalOverflow; } catch (e) {}
       throw err;
