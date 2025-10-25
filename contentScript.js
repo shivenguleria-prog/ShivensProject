@@ -1,23 +1,22 @@
 // contentScript.js
-// Scroll + capture + adaptive format logic:
-// - Save as PNG if total <= 19MB
-// - Else try single WebP (q=0.97)
-// - If WebP still >19MB, retry WebP (q=0.92)
-// - If still >19MB, split into multiple WebPs (try 0.97 then 0.92 per batch)
+// Fullpage capture with zoom, PNG-first, dual-WebP, precise scrolling and overlap minimization.
 
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
   window.__FULLPAGE_CAPTURE_INSTALLED = true;
 
   // ---- Configuration ----
-  const MAX_BYTES = 19 * 1024 * 1024; // 19 MB limit
+  const MAX_BYTES = 19 * 1024 * 1024; // 19 MB
   const CAPTURE_DELAY_MS = 550;
   const CAPTURE_MAX_RETRIES = 3;
   const CAPTURE_RETRY_BASE_DELAY = 300;
-  const WEBP_QUALITY_PRIMARY = 0.97; // primary webp quality
-  const WEBP_QUALITY_FALLBACK = 0.92; // fallback webp quality if primary > MAX_BYTES
-  const PNG_QUALITY = 0.92; // used only for canvas.toBlob if needed (PNG ignores quality but we keep param)
+  const WEBP_QUALITY_PRIMARY = 0.97;
+  const WEBP_QUALITY_FALLBACK = 0.92;
+  const PNG_QUALITY = 0.92; // PNG ignores quality mostly, kept param
   const ZOOM_FACTOR = 0.8; // 80% zoom
+  const ROW_HASH_MOD = 4294967291; // large prime for simple hash reduce
+  const MAX_OVERLAP_CHECK = 800; // maximum rows to consider for overlap (cap for perf)
+  const ROW_DIFF_TOLERANCE = 0; // exact row match required (set >0 to allow small diffs)
   // ------------------------
 
   let lastCaptureTs = 0;
@@ -82,6 +81,65 @@
     URL.revokeObjectURL(url);
   }
 
+  // Compute per-row hash array for an Image object
+  async function computeRowHashes(img) {
+    const w = img.width;
+    const h = img.height;
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, w, h);
+    const data = ctx.getImageData(0, 0, w, h).data;
+
+    const rowHashes = new Uint32Array(h);
+    // compute a simple rolling hash per row
+    for (let row = 0; row < h; row++) {
+      let hash = 2166136261 >>> 0; // FNV offset basis (32-bit)
+      const baseIndex = row * w * 4;
+      for (let x = 0; x < w; x++) {
+        // read RGBA
+        const r = data[baseIndex + x * 4];
+        const g = data[baseIndex + x * 4 + 1];
+        const b = data[baseIndex + x * 4 + 2];
+        const a = data[baseIndex + x * 4 + 3];
+        // fold pixels into hash
+        hash ^= r; hash = Math.imul(hash, 16777619) >>> 0;
+        hash ^= g; hash = Math.imul(hash, 16777619) >>> 0;
+        hash ^= b; hash = Math.imul(hash, 16777619) >>> 0;
+        hash ^= a; hash = Math.imul(hash, 16777619) >>> 0;
+      }
+      rowHashes[row] = hash;
+    }
+    return { width: w, height: h, rowHashes, img };
+  }
+
+  // Determine vertical overlap (rows) between top of b and bottom of a
+  // returns number of overlapping rows (0..maxPossible)
+  function findVerticalOverlap(aHashes, bHashes, maxCheck) {
+    // aHashes, bHashes are Uint32Array of per-row hashes
+    const aH = aHashes.length;
+    const bH = bHashes.length;
+    const maxPossible = Math.min(maxCheck, aH, bH);
+    if (maxPossible <= 0) return 0;
+
+    // We'll look for the largest overlap, scanning from maxPossible down to 1.
+    // For each candidate overlap 'o', check if the last 'o' rows of A match first 'o' rows of B.
+    for (let o = maxPossible; o >= 1; o--) {
+      let ok = true;
+      const aStart = aH - o;
+      const bStart = 0;
+      for (let r = 0; r < o; r++) {
+        if (Math.abs(aHashes[aStart + r] - bHashes[bStart + r]) > ROW_DIFF_TOLERANCE) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return o;
+    }
+    return 0;
+  }
+
   // ---------------- MAIN ----------------
   async function startCapture() {
     if (!document.body) throw new Error('No document body found');
@@ -92,11 +150,11 @@
     const originalZoom = document.documentElement.style.zoom || '';
 
     try {
-      // Apply zoom so captures reflect the zoomed layout
+      // apply zoom before measuring/layout
       document.documentElement.style.zoom = String(ZOOM_FACTOR);
-      await new Promise(r => setTimeout(r, 120)); // let layout settle
+      await new Promise(r => setTimeout(r, 160)); // allow layout reflow
 
-      // Measure after zoom applied
+      // measure after zoom
       const totalWidth = Math.max(document.documentElement.scrollWidth, document.body.scrollWidth);
       const totalHeight = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
       const viewportHeight = window.innerHeight;
@@ -116,16 +174,19 @@
 
       scrollingEl.style.overflow = 'hidden';
 
+      // Precise positions: cover the page with no overlapping repeats; final position exactly at bottom
       const positions = [];
-      for (let y = 0; y < totalHeight; y += viewportHeight) {
-        positions.push(Math.min(y, totalHeight - viewportHeight));
-        if (y + viewportHeight >= totalHeight) break;
+      let y = 0;
+      while (y < totalHeight - viewportHeight) {
+        positions.push(Math.round(y));
+        y += viewportHeight;
       }
+      positions.push(Math.max(0, Math.round(totalHeight - viewportHeight))); // ensure final bottom
 
-      // Capture each viewport position
+      // capture each viewport position
       const capturedDataUrls = [];
-      for (const y of positions) {
-        scrollingEl.scrollTo({ top: y, left: 0, behavior: 'instant' });
+      for (const pos of positions) {
+        scrollingEl.scrollTo({ top: pos, left: 0, behavior: 'instant' });
         await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS));
         const dataUrl = await safeCapture();
         capturedDataUrls.push(dataUrl);
@@ -139,119 +200,179 @@
         it.el.style.pointerEvents = it.orig.pointerEvents || '';
       });
 
-      // restore zoom before DOM operations after captures
+      // restore zoom
       document.documentElement.style.zoom = originalZoom;
 
-      // Load images
-      const images = [];
-      for (const d of capturedDataUrls) {
+      // load images and compute per-row hashes (used for overlap detection)
+      const loaded = [];
+      for (let i = 0; i < capturedDataUrls.length; i++) {
+        const d = capturedDataUrls[i];
         const img = await loadImage(d);
-        images.push({ img, width: img.width, height: img.height });
+        // For large captures this can be heavy; but we limit overlap checks later
+        const meta = await computeRowHashes(img);
+        loaded.push(meta);
       }
 
-      // helper: stitch vertically
-      async function stitchImages(imgItems, mime = 'image/png', quality = 0.92) {
-        const w = Math.max(...imgItems.map(i => i.width));
-        const h = imgItems.reduce((s, i) => s + i.height, 0);
-        const canvas = document.createElement('canvas');
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext('2d');
-        let y = 0;
-        for (const it of imgItems) {
-          ctx.drawImage(it.img, 0, y, it.width, it.height);
-          y += it.height;
+      // detect vertical overlaps between consecutive images
+      const overlaps = []; // overlaps[i] = number of rows overlapped between loaded[i] and loaded[i+1]
+      for (let i = 0; i < loaded.length - 1; i++) {
+        const a = loaded[i];
+        const b = loaded[i + 1];
+        // choose reasonable max check: min(height/2, MAX_OVERLAP_CHECK)
+        const maxCheck = Math.min(Math.floor(a.height / 2), Math.floor(b.height / 2), MAX_OVERLAP_CHECK);
+        const o = findVerticalOverlap(a.rowHashes, b.rowHashes, maxCheck);
+        overlaps.push(o);
+      }
+
+      // Stitch images vertically while removing overlaps
+      // Calculate final stitched height
+      let stitchedWidth = 0;
+      let stitchedHeight = 0;
+      for (let i = 0; i < loaded.length; i++) {
+        stitchedWidth = Math.max(stitchedWidth, loaded[i].width);
+        stitchedHeight += loaded[i].height;
+        if (i < overlaps.length) stitchedHeight -= overlaps[i]; // subtract overlapped rows
+      }
+
+      // create canvas and draw with offsets adjusted for overlaps
+      const canvas = document.createElement('canvas');
+      canvas.width = stitchedWidth;
+      canvas.height = stitchedHeight;
+      const ctx = canvas.getContext('2d');
+
+      let yOffset = 0;
+      for (let i = 0; i < loaded.length; i++) {
+        const meta = loaded[i];
+        // If overlap with previous exists, we draw skipping the top 'overlapPrev' rows of this image
+        let skipTop = 0;
+        if (i > 0) {
+          skipTop = overlaps[i - 1] || 0;
         }
+        if (skipTop === 0) {
+          ctx.drawImage(meta.img, 0, 0, meta.width, meta.height, 0, yOffset, meta.width, meta.height);
+          yOffset += meta.height;
+        } else {
+          // draw only the portion from skipTop..height
+          const srcY = skipTop;
+          const srcH = meta.height - skipTop;
+          ctx.drawImage(meta.img, 0, srcY, meta.width, srcH, 0, yOffset, meta.width, srcH);
+          yOffset += srcH;
+        }
+      }
+
+      // Helper to attempt and save with given mime/quality
+      async function trySave(mime, quality) {
         const blob = await canvasToBlob(canvas, mime, quality);
-        return { blob, width: w, height: h, mime };
+        return blob;
       }
 
       // 1) Try PNG full
-      const { blob: pngBlob } = await stitchImages(images, 'image/png', PNG_QUALITY);
+      const pngBlob = await trySave('image/png', PNG_QUALITY);
       if (pngBlob.size <= MAX_BYTES) {
         saveBlob(pngBlob, 'png');
         alert('Saved as PNG (under 19MB)');
         return;
       }
 
-      // 2) Try full WebP at primary quality
-      const { blob: webpPrimary } = await stitchImages(images, 'image/webp', WEBP_QUALITY_PRIMARY);
+      // 2) Try WebP primary
+      let webpPrimary = await trySave('image/webp', WEBP_QUALITY_PRIMARY);
       if (webpPrimary.size <= MAX_BYTES) {
         saveBlob(webpPrimary, 'webp');
         alert('Saved as single WebP (quality ' + WEBP_QUALITY_PRIMARY + ')');
         return;
       }
 
-      // 3) Try full WebP at fallback quality
-      const { blob: webpFallback } = await stitchImages(images, 'image/webp', WEBP_QUALITY_FALLBACK);
+      // 3) Try WebP fallback
+      let webpFallback = await trySave('image/webp', WEBP_QUALITY_FALLBACK);
       if (webpFallback.size <= MAX_BYTES) {
         saveBlob(webpFallback, 'webp');
         alert('Saved as single WebP (quality ' + WEBP_QUALITY_FALLBACK + ')');
         return;
       }
 
-      // 4) Need to split into batches — attempt to form batches using primary quality
+      // 4) If still too big, split into batches intelligently using overlap-aware stitching per batch
+      // We'll build batches of consecutive captured frames grouping until the stitched webp at primary is > MAX_BYTES,
+      // then finalize the previous group. For each final group we will try primary then fallback.
       const batches = [];
-      let currentBatch = [];
+      let batchStart = 0;
 
-      for (let i = 0; i < images.length; i++) {
-        const candidate = images[i];
-        const tryBatch = currentBatch.concat([candidate]);
-        const { blob: testBlob } = await stitchImages(tryBatch, 'image/webp', WEBP_QUALITY_PRIMARY);
-
-        if (testBlob.size <= MAX_BYTES) {
-          // fits at primary quality — accept it
-          currentBatch = tryBatch;
-        } else {
-          // doesn't fit at primary quality
-          if (currentBatch.length > 0) {
-            // finalize previous batch
-            const { blob } = await stitchImages(currentBatch, 'image/webp', WEBP_QUALITY_PRIMARY);
-            batches.push({ blob, items: currentBatch.slice(), q: WEBP_QUALITY_PRIMARY });
+      // helper to produce a stitched blob for a range [s,e] inclusive using same approach above
+      async function stitchRangeToBlob(s, e, mime, quality) {
+        // determine stitched width/height for this range using precomputed overlaps
+        let w = 0, h = 0;
+        for (let k = s; k <= e; k++) {
+          w = Math.max(w, loaded[k].width);
+          h += loaded[k].height;
+          if (k < e) h -= overlaps[k] || 0;
+        }
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        const cctx = c.getContext('2d');
+        let yOff = 0;
+        for (let k = s; k <= e; k++) {
+          const meta = loaded[k];
+          const skipTop = (k > s) ? (overlaps[k - 1] || 0) : 0;
+          if (skipTop === 0) {
+            cctx.drawImage(meta.img, 0, 0, meta.width, meta.height, 0, yOff, meta.width, meta.height);
+            yOff += meta.height;
+          } else {
+            const srcY = skipTop;
+            const srcH = meta.height - skipTop;
+            cctx.drawImage(meta.img, 0, srcY, meta.width, srcH, 0, yOff, meta.width, srcH);
+            yOff += srcH;
           }
-          // start new batch with candidate
-          currentBatch = [candidate];
+        }
+        const blob = await canvasToBlob(c, mime, quality);
+        return blob;
+      }
 
-          // if single candidate is already > MAX_BYTES at primary, we still add it as single-item batch.
-          // We'll attempt fallback quality later when saving.
-          const { blob: singleTest } = await stitchImages(currentBatch, 'image/webp', WEBP_QUALITY_PRIMARY);
-          if (singleTest.size > MAX_BYTES) {
-            // still oversized at primary; continue and let fallback handle when saving
-            // finalize this single-item batch now so we don't loop infinitely
-            const { blob: singleBlobPrimary } = await stitchImages(currentBatch, 'image/webp', WEBP_QUALITY_PRIMARY);
-            batches.push({ blob: singleBlobPrimary, items: currentBatch.slice(), q: WEBP_QUALITY_PRIMARY });
-            currentBatch = [];
+      // Build batches
+      for (let i = 0; i < loaded.length; i++) {
+        // attempt to grow a batch from batchStart..i
+        const testBlob = await stitchRangeToBlob(batchStart, i, 'image/webp', WEBP_QUALITY_PRIMARY);
+        if (testBlob.size <= MAX_BYTES) {
+          // still fits — continue to next
+          if (i === loaded.length - 1) {
+            // last one fits too, finalize
+            batches.push({ s: batchStart, e: i, preferred: 'primary' });
+          }
+          continue;
+        } else {
+          // testBlob > MAX_BYTES — we must finalize the previous batch batchStart..i-1 (if any)
+          if (i - 1 >= batchStart) {
+            batches.push({ s: batchStart, e: i - 1, preferred: 'primary' });
+            batchStart = i; // new batch starting at i
+          } else {
+            // single capture at i already too big at primary — finalize it (we'll try fallback when saving)
+            batches.push({ s: i, e: i, preferred: 'primary' });
+            batchStart = i + 1;
           }
         }
       }
 
-      if (currentBatch.length > 0) {
-        const { blob } = await stitchImages(currentBatch, 'image/webp', WEBP_QUALITY_PRIMARY);
-        batches.push({ blob, items: currentBatch.slice(), q: WEBP_QUALITY_PRIMARY });
-      }
-
-      // Save each batch: try primary quality first, if too big then fallback quality
-      for (let i = 0; i < batches.length; i++) {
-        const b = batches[i];
-        // If the blob we already computed at primary is <= MAX_BYTES, use it
-        if (b.blob.size <= MAX_BYTES) {
-          saveBlob(b.blob, 'webp', i + 1);
+      // Save batches (try primary quality blob first; if > MAX_BYTES, try fallback; if still >MAX_BYTES, save fallback anyway)
+      for (let bi = 0; bi < batches.length; bi++) {
+        const { s, e } = batches[bi];
+        const blobPrimary = await stitchRangeToBlob(s, e, 'image/webp', WEBP_QUALITY_PRIMARY);
+        if (blobPrimary.size <= MAX_BYTES) {
+          saveBlob(blobPrimary, 'webp', bi + 1);
           continue;
         }
-        // else try fallback
-        const { blob: bf } = await stitchImages(b.items, 'image/webp', WEBP_QUALITY_FALLBACK);
-        if (bf.size <= MAX_BYTES) {
-          saveBlob(bf, 'webp', i + 1);
-        } else {
-          // as a last resort, save the fallback (even if > MAX_BYTES) but warn the user
-          saveBlob(bf, 'webp', i + 1);
-          console.warn(`Batch ${i + 1} still exceeds ${MAX_BYTES} bytes even at fallback quality (${WEBP_QUALITY_FALLBACK}). Saved anyway.`);
+        const blobFallback = await stitchRangeToBlob(s, e, 'image/webp', WEBP_QUALITY_FALLBACK);
+        if (blobFallback.size <= MAX_BYTES) {
+          saveBlob(blobFallback, 'webp', bi + 1);
+          continue;
         }
+        // still too big — save fallback and warn
+        saveBlob(blobFallback, 'webp', bi + 1);
+        console.warn(`Saved batch ${bi + 1} at fallback quality but size still > ${MAX_BYTES}.`);
       }
 
-      alert(`Saved as ${batches.length} WebP image(s) (attempted quality ${WEBP_QUALITY_PRIMARY} then ${WEBP_QUALITY_FALLBACK})`);
+      alert(`Saved ${batches.length} WebP file(s) after batching (tried ${WEBP_QUALITY_PRIMARY} then ${WEBP_QUALITY_FALLBACK})`);
+
     } catch (err) {
-      // ensure cleanup on error
+      // cleanup on error
       try { document.documentElement.style.zoom = originalZoom; } catch (e) {}
       try { scrollingEl.style.overflow = originalOverflow; } catch (e) {}
       throw err;
@@ -264,4 +385,5 @@
     const name = index ? `${base}_part${index}.${ext}` : `${base}_fullpage.${ext}`;
     downloadBlob(blob, name);
   }
+
 })();
