@@ -1,7 +1,7 @@
 // contentScript.js
 // Full-page capture with:
 // - Pre-scroll to allow lazy-loading
-// - Automatic zoom adjustment based on DPR and page height
+// - Automatic zoom adjustment based on DPR and page height (now using CSS transform: scale)
 // - Safe stitched export (PNG → WebP → split if >19MB)
 
 (() => {
@@ -9,12 +9,12 @@
   window.__FULLPAGE_CAPTURE_INSTALLED = true;
 
   // ---------- CONFIG ----------
-  const MAX_BYTES = 19 * 1024 * 1024;  // 19 MB limit
+  const MAX_BYTES = 19 * 1024 * 1024; // 19 MB limit
   const CAPTURE_DELAY_MS = 550;
   const CAPTURE_MAX_RETRIES = 3;
   const CAPTURE_RETRY_BASE_DELAY = 300;
   const WEBP_QUALITY = 0.92;
-  const SAFE_CANVAS_HEIGHT = 30000;  // Chrome safe limit
+  const SAFE_CANVAS_HEIGHT = 30000; // Chrome safe limit
   // ----------------------------
 
   let lastCaptureTs = 0;
@@ -237,17 +237,28 @@
     const scrollEl = detectScrollContainer();
     const originalScroll = scrollEl.scrollTop;
     const originalOverflow = scrollEl.style.overflow;
+    
+    // Save original styles for restoration
     const origZoom = document.documentElement.style.zoom || '';
+    const origTransform = document.body.style.transform || '';
+    const origTransformOrigin = document.body.style.transformOrigin || '';
+    const origBodyWidth = document.body.style.width || '';
 
     try {
       // === Auto Zoom Adjustment (Dynamic DPR Scaling) ===
       const cssHeight = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
       const dpr = window.devicePixelRatio || 1;
       const estimatedPixels = cssHeight * dpr;
+      
       if (estimatedPixels > SAFE_CANVAS_HEIGHT) {
         const scale = SAFE_CANVAS_HEIGHT / estimatedPixels;
-        document.documentElement.style.zoom = scale.toString();
-        console.log(`[Auto Zoom] Applying zoom: ${scale.toFixed(3)} to prevent exceeding GPU limit`);
+        
+        // Use transform: scale for better reliability over documentElement.style.zoom
+        document.body.style.transform = `scale(${scale})`;
+        document.body.style.transformOrigin = 'top left';
+        document.body.style.width = `${100 / scale}%`; // Adjust body width to keep scrollbar correct
+        
+        console.log(`[Auto Zoom] Applying transform scale: ${scale.toFixed(3)} to prevent exceeding GPU limit`);
       } else {
         console.log(`[Auto Zoom] No zoom needed (estimated ${estimatedPixels}px)`);
       }
@@ -261,7 +272,10 @@
       for (let i = 0; i < pre.positions.length; i++) {
         const y = pre.positions[i];
         try { scrollEl.scrollTo({ top: y, left: 0, behavior: 'instant' }); } catch {}
-        await new Promise(r => requestAnimationFrame(() => setTimeout(r, 420)));
+        
+        // Increased delay slightly for stability after scroll and zoom adjustment
+        await new Promise(r => requestAnimationFrame(() => setTimeout(r, 600))); 
+        
         const dataUrl = await safeCapture();
         capturedDataUrls.push(dataUrl);
       }
@@ -299,9 +313,15 @@
       }
       alert(`Saved ${parts.length} image(s).`);
     } finally {
+      // --- Restoration ---
       try { scrollEl.style.overflow = originalOverflow; } catch {}
       try { scrollEl.scrollTo({ top: originalScroll, left: 0, behavior: 'instant' }); } catch {}
+      
+      // Restore original zoom and transform styles
       document.documentElement.style.zoom = origZoom;
+      document.body.style.transform = origTransform;
+      document.body.style.transformOrigin = origTransformOrigin;
+      document.body.style.width = origBodyWidth;
     }
   }
 })();
