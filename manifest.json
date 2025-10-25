@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Simple Full Page Capture (learn)",
+  "name": "DesignlensUX Full Page Capture",
   "version": "1.0",
-  "description": "Scroll-capture and stitch full page screenshots (example).",
+  "description": "Capture full-page screenshots easily.",
   "permissions": [
     "tabs",
     "scripting",
