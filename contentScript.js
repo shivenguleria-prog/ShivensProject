@@ -2,13 +2,8 @@
 // Full-page capture script
 // MODIFIED: 
 // 1. Logic added to temporarily hide fixed/sticky headers during capture (CSS Override).
-// 2. Dynamic scrolling loop implemented to prevent content overlap from DOM reflows.
-// 3. CAPTURE_DELAY_MS increased to 900ms for better lazy-loading stabilization.
-// - No forced zoom, no hiding fixed/sticky elements
-// - Disables scrolling during capture and restores afterwards
-// - Encoding sequence per batch: JPG(0.97) -> JPG(0.95) -> WebP(0.97) -> WebP(0.92)
-// - Max per-file size: 24 MB
-// - Uses background message { action: 'capture-visible' } to get visible capture dataUrl
+// 2. Dynamic scrolling loop implemented to prevent content overlap from main page DOM reflows.
+// 3. Inner scrollable elements (like carousels/tabs) are pre-scrolled to ensure all content is loaded and prevents mismatch/overlap.
 
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
@@ -16,20 +11,21 @@
 
   // ---- Configuration ----
   const MAX_BYTES = 24 * 1024 * 1024; // 24 MB limit
-  const CAPTURE_DELAY_MS = 900;       // Adjusted delay for stabilization
+  const CAPTURE_DELAY_MS = 550;       // Reverted to 550ms as requested
   const CAPTURE_MAX_RETRIES = 3;
   const CAPTURE_RETRY_BASE_DELAY = 300;
 
   // Encoding qualities
-  const JPEG_QUALITY_HIGH = 0.97; // first try JPG
-  const JPEG_QUALITY = 0.95;      // second try JPG
-  const WEBP_QUALITY_HIGH = 0.97; // third try WebP
-  const WEBP_QUALITY_FALLBACK = 0.92; // final try WebP
+  const JPEG_QUALITY_HIGH = 0.97;
+  const JPEG_QUALITY = 0.95;
+  const WEBP_QUALITY_HIGH = 0.97;
+  const WEBP_QUALITY_FALLBACK = 0.92;
 
-  // Safe canvas max height to avoid browser limits (tweak if needed)
+  // Safe canvas max height to avoid browser limits
   const MAX_CANVAS_HEIGHT = 30000; // px
 
   // --- STICKY/FIXED HEADER HIDING CONFIG ---
+  // Selectors for elements that should be hidden to avoid repetition
   const FIXED_ELEMENT_SELECTORS = [
     'header',
     '.fixed',
@@ -45,7 +41,8 @@
     if (msg && msg.action === 'start-capture') {
       startCapture().catch(e => {
         console.error('Capture failed', e);
-        alert('Capture failed: ' + (e && e.message ? e.message : e));
+        // Use console.log for errors instead of alert for better debugging in canvas environment
+        console.log('Capture failed: ' + (e && e.message ? e.message : e));
       });
     }
   });
@@ -90,7 +87,6 @@
 
   function canvasToBlob(canvas, type = 'image/jpeg', quality = 0.95) {
     return new Promise((resolve) => {
-      // toBlob may provide null in rare cases; resolve null to be checked by caller
       canvas.toBlob(blob => resolve(blob), type, quality);
     });
   }
@@ -103,7 +99,6 @@
     document.body.appendChild(a);
     a.click();
     a.remove();
-    // revoke after short delay to ensure download has started
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
@@ -117,7 +112,6 @@
     let current = [];
     let currentH = 0;
     for (const img of images) {
-      // If single tile exceeds maxHeight, still put it in its own batch (risk-y but necessary)
       if (img.height > maxHeight) {
         if (current.length) {
           batches.push(current);
@@ -164,18 +158,15 @@
       try {
         const elements = document.querySelectorAll(selector);
         elements.forEach(el => {
-          // Check for fixed/sticky position before hiding
           const style = window.getComputedStyle(el);
           const position = style.getPropertyValue('position');
 
-          // Only proceed if the element is actually fixed/sticky
           if (position === 'fixed' || position === 'sticky') {
             const originalDisplay = el.style.getPropertyValue('display');
             const originalImportance = el.style.getPropertyPriority('display');
             
             elementsToRestore.push({ el, originalDisplay, originalImportance });
             
-            // Hide element
             el.style.setProperty('display', 'none', 'important');
           }
         });
@@ -189,13 +180,59 @@
   // Utility to restore elements
   function restoreFixedElements(elementsToRestore) {
     elementsToRestore.forEach(({ el, originalDisplay, originalImportance }) => {
-      // Restore original display style
       if (originalDisplay) {
         el.style.setProperty('display', originalDisplay, originalImportance);
       } else {
         el.style.removeProperty('display');
       }
     });
+  }
+  
+  // NEW: Identify inner scrollable elements
+  function findInnerScrollableElements(scrollingEl) {
+    const scrollables = [];
+    document.querySelectorAll('*').forEach(el => {
+      // Ignore the main scrolling element (document body/documentElement)
+      if (el === scrollingEl || el === document.body || el === document.documentElement) return;
+
+      const style = window.getComputedStyle(el);
+      const overflowY = style.getPropertyValue('overflow-y');
+      const overflowX = style.getPropertyValue('overflow-x');
+
+      const isScrollable = (overflowY === 'scroll' || overflowY === 'auto') && el.scrollHeight > el.clientHeight;
+      const isHorizontalScrollable = (overflowX === 'scroll' || overflowX === 'auto') && el.scrollWidth > el.clientWidth;
+
+      if (isScrollable || isHorizontalScrollable) {
+        scrollables.push(el);
+      }
+    });
+    return scrollables;
+  }
+  
+  // NEW: Stabilize inner scrollable elements by forcing a full scroll
+  async function stabilizeInnerScrollables(elements) {
+    console.log(`Stabilizing ${elements.length} inner scrollable elements...`);
+    
+    // Perform scroll for each element to force lazy content load
+    for (const el of elements) {
+      // Save original scroll position
+      const originalScrollTop = el.scrollTop;
+      const originalScrollLeft = el.scrollLeft;
+
+      // Scroll to bottom (vertical) and right (horizontal)
+      el.scrollTop = el.scrollHeight;
+      el.scrollLeft = el.scrollWidth;
+
+      // Wait for content to load/reflow
+      await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS / 2)); 
+
+      // Restore original scroll position
+      el.scrollTop = originalScrollTop;
+      el.scrollLeft = originalScrollLeft;
+    }
+    // Wait one final time for the entire DOM to settle after all inner scrolls are complete
+    await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS)); 
+    console.log('Stabilization complete.');
   }
 
 
@@ -210,6 +247,10 @@
     // 1. Identify and hide fixed/sticky elements
     const elementsToRestore = hideFixedElements(FIXED_ELEMENT_SELECTORS);
     
+    // 2. NEW: Stabilize inner scrollable content
+    const innerScrollables = findInnerScrollableElements(scrollingEl);
+    await stabilizeInnerScrollables(innerScrollables);
+    
     const viewportHeight = window.innerHeight;
     const capturedDataUrls = [];
 
@@ -220,7 +261,7 @@
       // ignore if cannot set
     }
     
-    // 2. Dynamic Scrolling Loop
+    // 3. Dynamic Scrolling Loop
     let currentScrollTop = 0;
     
     try {
@@ -239,7 +280,7 @@
 
         // Scroll to the target position
         scrollingEl.scrollTo({ top: targetScrollTop, left: 0, behavior: 'auto' });
-        await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS)); // Wait for lazy load/reflow
+        await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS)); 
 
         // Update current position after scroll (crucial for handling reflows)
         currentScrollTop = scrollingEl.scrollTop;
@@ -364,9 +405,10 @@
 
     // Inform user (brief)
     if (outputs.length === 1) {
-      alert(`Saved 1 file (${Math.round(outputs[0].blob.size / 1024 / 1024)} MB): ${base}_fullpage_${ts}.${outputs[0].ext}`);
+      // Using console.log instead of alert
+      console.log(`Saved 1 file (${Math.round(outputs[0].blob.size / 1024 / 1024)} MB): ${base}_fullpage_${ts}.${outputs[0].ext}`);
     } else {
-      alert(`Saved ${outputs.length} file(s).`);
+      console.log(`Saved ${outputs.length} file(s).`);
     }
   }
 
