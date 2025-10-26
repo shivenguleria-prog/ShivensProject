@@ -1,6 +1,8 @@
 // contentScript.js
 // Full-page capture script
-// MODIFIED: Added logic to temporarily hide fixed/sticky headers during capture.
+// MODIFIED: 
+// 1. Logic added to temporarily hide fixed/sticky headers during capture (CSS Override).
+// 2. Dynamic scrolling loop implemented to prevent content overlap from DOM reflows.
 // - No forced zoom, no hiding fixed/sticky elements
 // - Disables scrolling during capture and restores afterwards
 // - Encoding sequence per batch: JPG(0.97) -> JPG(0.95) -> WebP(0.97) -> WebP(0.92)
@@ -28,7 +30,6 @@
 
   // --- STICKY/FIXED HEADER HIDING CONFIG ---
   // IMPORTANT: You might need to adjust these selectors for the specific website.
-  // These are common selectors for sticky elements.
   const FIXED_ELEMENT_SELECTORS = [
     'header',
     '.fixed',
@@ -156,7 +157,7 @@
     return { blob, width: w, height: h, mime };
   }
   
-  // New utility to collect and temporarily hide fixed elements
+  // Utility to collect and temporarily hide fixed elements
   function hideFixedElements(selectors) {
     const elementsToRestore = [];
     for (const selector of selectors) {
@@ -185,7 +186,7 @@
     return elementsToRestore;
   }
 
-  // New utility to restore elements
+  // Utility to restore elements
   function restoreFixedElements(elementsToRestore) {
     elementsToRestore.forEach(({ el, originalDisplay, originalImportance }) => {
       // Restore original display style
@@ -206,13 +207,11 @@
     const originalOverflow = scrollingEl.style.overflow;
     const originalScrollTop = scrollingEl.scrollTop;
     
-    // --- NEW: Identify and hide fixed/sticky elements ---
+    // 1. Identify and hide fixed/sticky elements
     const elementsToRestore = hideFixedElements(FIXED_ELEMENT_SELECTORS);
     
-    // Calculate full page positions BEFORE capturing
-    const totalWidth = Math.max(document.documentElement.scrollWidth, document.body.scrollWidth);
-    const totalHeight = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
     const viewportHeight = window.innerHeight;
+    const capturedDataUrls = [];
 
     // Prevent page jumps during capture
     try {
@@ -220,30 +219,57 @@
     } catch (e) {
       // ignore if cannot set
     }
-
-    const positions = [];
-    for (let y = 0; y < totalHeight; y += viewportHeight) {
-      positions.push(Math.min(y, totalHeight - viewportHeight));
-      if (y + viewportHeight >= totalHeight) break;
-    }
-
-    const capturedDataUrls = [];
+    
+    // 2. Dynamic Scrolling Loop
+    let currentScrollTop = 0;
+    
     try {
-      for (const y of positions) {
-        // scroll to position (behavior auto for compatibility)
-        scrollingEl.scrollTo({ top: y, left: 0, behavior: 'auto' });
+      // Scroll to the very top initially
+      scrollingEl.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+      await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS));
+      
+      // Capture the first tile (y=0)
+      const dataUrl0 = await safeCapture();
+      capturedDataUrls.push(dataUrl0);
+
+      // Loop until we reach the bottom of the scrollable content
+      while (true) {
+        // Calculate next target position
+        let targetScrollTop = currentScrollTop + viewportHeight;
+
+        // Scroll to the target position
+        scrollingEl.scrollTo({ top: targetScrollTop, left: 0, behavior: 'auto' });
         await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS));
+
+        // Update current position after scroll (crucial for handling reflows)
+        currentScrollTop = scrollingEl.scrollTop;
+        
+        // Check if we've reached the bottom
+        const maxScrollTop = scrollingEl.scrollHeight - viewportHeight;
+        const isAtBottom = currentScrollTop >= maxScrollTop;
+
+        // Capture the tile
         const dataUrl = await safeCapture();
         capturedDataUrls.push(dataUrl);
+
+        // If we are at the very bottom, break the loop
+        if (isAtBottom) break;
+        
+        // Safety break
+        if (capturedDataUrls.length > 50) { 
+          console.warn('Reached safety limit of 50 tiles.');
+          break;
+        }
       }
+
     } finally {
-      // restore scroll/overflow AND fixed elements
+      // Restore scroll/overflow AND fixed elements
       try {
         scrollingEl.scrollTo({ top: originalScrollTop, left: 0, behavior: 'auto' });
         scrollingEl.style.overflow = originalOverflow;
       } catch (e) { /* ignore */ }
       
-      // --- NEW: Restore fixed/sticky elements ---
+      // Restore fixed/sticky elements
       restoreFixedElements(elementsToRestore);
     }
     
