@@ -3,7 +3,8 @@
 // MODIFIED: 
 // 1. Logic adjusted to hide fixed/sticky headers *after* the first tile capture, 
 //    ensuring the header is present in the first screenshot tile.
-// 2. Dynamic scrolling loop implemented to prevent content overlap from DOM reflows.
+// 2. EXPANDED FIXED_ELEMENT_SELECTORS to target more common header classes/IDs.
+// 3. Dynamic scrolling loop implemented to prevent content overlap from DOM reflows.
 // - No forced zoom, no hiding fixed/sticky elements
 // - Disables scrolling during capture and restores afterwards
 // - Encoding sequence per batch: JPG(0.97) -> JPG(0.95) -> WebP(0.97) -> WebP(0.92)
@@ -30,13 +31,33 @@
   const MAX_CANVAS_HEIGHT = 30000; // px
 
   // --- STICKY/FIXED HEADER HIDING CONFIG ---
-  // IMPORTANT: You might need to adjust these selectors for the specific website.
+  // EXPANDED SELECTOR LIST: This targets a much wider range of common fixed/sticky elements.
   const FIXED_ELEMENT_SELECTORS = [
-    'header',
-    '.fixed',
-    '.sticky',
+    // 1. Semantic Tags & Common IDs
+    'header',               
+    'nav',                  
+    '#header',              
+    '#navbar',              
+    '.site-header',         
+    '.main-header',         
+
+    // 2. Direct CSS Position Attributes (Most reliable)
+    '.fixed',               
+    '.sticky',              
     '[style*="position: fixed"]',
-    '[style*="position: sticky"]'
+    '[style*="position: sticky"]',
+
+    // 3. Common/Framework-Specific Classes
+    '.navbar-fixed-top',    // Common Bootstrap/framework class
+    '.navbar-sticky',       
+    '.header-fixed',        
+    '.is-fixed',            // State-based class often added by JS
+    '.is-sticky',           // State-based class often added by JS
+    '.sticky-top',          // Bootstrap 4+ class
+
+    // 4. Common High Z-Index Overrides (Use with caution - targets overlays)
+    '[style*="z-index: 1000"]',
+    '[style*="z-index: 9999"]' 
   ];
   // ------------------------------------------
 
@@ -165,12 +186,13 @@
       try {
         const elements = document.querySelectorAll(selector);
         elements.forEach(el => {
-          // Check for fixed/sticky position before hiding
+          // Check for fixed/sticky position or high z-index before hiding
           const style = window.getComputedStyle(el);
           const position = style.getPropertyValue('position');
+          const zIndex = style.getPropertyValue('z-index');
 
-          // Only proceed if the element is actually fixed/sticky
-          if (position === 'fixed' || position === 'sticky') {
+          // Only proceed if the element is actually fixed/sticky OR has a high z-index
+          if (position === 'fixed' || position === 'sticky' || (zIndex !== 'auto' && parseInt(zIndex) >= 1000)) {
             const originalDisplay = el.style.getPropertyValue('display');
             const originalImportance = el.style.getPropertyPriority('display');
             
@@ -208,7 +230,7 @@
     const originalOverflow = scrollingEl.style.overflow;
     const originalScrollTop = scrollingEl.scrollTop;
     
-    // NOTE: elementsToRestore is now initialized here and populated *after* the first capture
+    // elementsToRestore is now initialized here and populated *after* the first capture
     let elementsToRestore = []; 
     
     const viewportHeight = window.innerHeight;
@@ -233,11 +255,9 @@
       const dataUrl0 = await safeCapture();
       capturedDataUrls.push(dataUrl0);
       
-      // --- MODIFICATION START ---
       // 1. Identify and hide fixed/sticky elements ONLY NOW, after the first tile capture
       elementsToRestore = hideFixedElements(FIXED_ELEMENT_SELECTORS);
-      // --- MODIFICATION END ---
-
+      
 
       // Loop until we reach the bottom of the scrollable content
       while (true) {
