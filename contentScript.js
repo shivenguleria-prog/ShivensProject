@@ -1,14 +1,14 @@
 // contentScript.js
 // Full-page capture script
-// FINAL RESOLUTION: Implements targeted visual freeze and increased stabilization time.
-// 
-// MODIFICATIONS SUMMARY: 
-// 1. **REFINED FIX**: Reverted to selective element manipulation but added inline styles
-//    to freeze transitions/animations on fixed/sticky elements to prevent "toggling."
-// 2. **INCREASED STABILITY DELAY**: PRE_SCROLL_STABILIZATION_MS increased to 1500ms.
-// 3. Selective Fixed/Sticky Element Hiding is maintained.
-// 4. Dynamic scrolling loop maintained.
-// 5. CAPTURE_DELAY_MS kept at 550ms.
+// MODIFIED: 
+// 1. Logic adjusted to hide fixed/sticky headers *after* the first tile capture, 
+//    ensuring the header is present in the first screenshot tile.
+// 2. Dynamic scrolling loop implemented to prevent content overlap from DOM reflows.
+// - No forced zoom, no hiding fixed/sticky elements
+// - Disables scrolling during capture and restores afterwards
+// - Encoding sequence per batch: JPG(0.97) -> JPG(0.95) -> WebP(0.97) -> WebP(0.92)
+// - Max per-file size: 24 MB
+// - Uses background message { action: 'capture-visible' } to get visible capture dataUrl
 
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
@@ -16,35 +16,29 @@
 
   // ---- Configuration ----
   const MAX_BYTES = 24 * 1024 * 1024; // 24 MB limit
-  const CAPTURE_DELAY_MS = 550;       // Kept at 550ms (delay between scroll and capture)
+  const CAPTURE_DELAY_MS = 550;
   const CAPTURE_MAX_RETRIES = 3;
   const CAPTURE_RETRY_BASE_DELAY = 300;
-  // Increased stabilization wait time after aggressive scroll-to-bottom
-  const PRE_SCROLL_STABILIZATION_MS = 1500; 
 
   // Encoding qualities
-  const JPEG_QUALITY_HIGH = 0.97;
-  const JPEG_QUALITY = 0.95;
-  const WEBP_QUALITY_HIGH = 0.97;
-  const WEBP_QUALITY_FALLBACK = 0.92;
+  const JPEG_QUALITY_HIGH = 0.97; // first try JPG
+  const JPEG_QUALITY = 0.95;      // second try JPG
+  const WEBP_QUALITY_HIGH = 0.97; // third try WebP
+  const WEBP_QUALITY_FALLBACK = 0.92; // final try WebP
 
-  // Safe canvas max height to avoid browser limits
+  // Safe canvas max height to avoid browser limits (tweak if needed)
   const MAX_CANVAS_HEIGHT = 30000; // px
 
-  // --- ELEMENTS TO MANIPULATE (Fixed/Sticky elements that repeat or cause animation issues) ---
-  const TARGET_ELEMENT_SELECTORS = [
-    'header', 
-    'footer', 
+  // --- STICKY/FIXED HEADER HIDING CONFIG ---
+  // IMPORTANT: You might need to adjust these selectors for the specific website.
+  const FIXED_ELEMENT_SELECTORS = [
+    'header',
     '.fixed',
     '.sticky',
     '[style*="position: fixed"]',
-    '[style*="position: sticky"]',
-    '#header', 
-    '#fixed-bar',
-    '.animated', // Catch common animation classes
-    '[class*="slide"]' // Catch common carousel/slider/tab classes
+    '[style*="position: sticky"]'
   ];
-  // ------------------------------------------------------------------------------------------
+  // ------------------------------------------
 
   let lastCaptureTs = 0;
 
@@ -52,7 +46,7 @@
     if (msg && msg.action === 'start-capture') {
       startCapture().catch(e => {
         console.error('Capture failed', e);
-        console.log('Capture failed: ' + (e && e.message ? e.message : e));
+        alert('Capture failed: ' + (e && e.message ? e.message : e));
       });
     }
   });
@@ -97,6 +91,7 @@
 
   function canvasToBlob(canvas, type = 'image/jpeg', quality = 0.95) {
     return new Promise((resolve) => {
+      // toBlob may provide null in rare cases; resolve null to be checked by caller
       canvas.toBlob(blob => resolve(blob), type, quality);
     });
   }
@@ -109,6 +104,7 @@
     document.body.appendChild(a);
     a.click();
     a.remove();
+    // revoke after short delay to ensure download has started
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
@@ -122,6 +118,7 @@
     let current = [];
     let currentH = 0;
     for (const img of images) {
+      // If single tile exceeds maxHeight, still put it in its own batch (risk-y but necessary)
       if (img.height > maxHeight) {
         if (current.length) {
           batches.push(current);
@@ -161,35 +158,25 @@
     return { blob, width: w, height: h, mime };
   }
   
-  // UTILITY: Temporarily freezes transitions/animations AND hides fixed elements.
-  function temporarilyFreezeVisuals(selectors) {
+  // Utility to collect and temporarily hide fixed elements
+  function hideFixedElements(selectors) {
     const elementsToRestore = [];
-    
-    // Inline style overrides to freeze transitions and animations
-    const FREEZE_STYLE = 'transition: none !important; animation: none !important;';
-
     for (const selector of selectors) {
       try {
         const elements = document.querySelectorAll(selector);
         elements.forEach(el => {
+          // Check for fixed/sticky position before hiding
           const style = window.getComputedStyle(el);
           const position = style.getPropertyValue('position');
 
-          let isFixed = position === 'fixed' || position === 'sticky';
-          
-          // --- 1. Freeze Visual Movement ---
-          const originalStyle = el.style.cssText;
-          elementsToRestore.push({ el, originalStyle });
-          el.style.cssText += FREEZE_STYLE; // Append the freeze styles
-
-          // --- 2. Hide Fixed Elements (only if fixed/sticky) ---
-          if (isFixed) {
+          // Only proceed if the element is actually fixed/sticky
+          if (position === 'fixed' || position === 'sticky') {
             const originalDisplay = el.style.getPropertyValue('display');
             const originalImportance = el.style.getPropertyPriority('display');
             
-            // Overwrite display only if it was fixed/sticky
-            elementsToRestore.pop(); // Remove the push above to replace it with a more specific restore object
-            elementsToRestore.push({ el, originalStyle, isFixed: true, originalDisplay, originalImportance });
+            elementsToRestore.push({ el, originalDisplay, originalImportance });
+            
+            // Hide element
             el.style.setProperty('display', 'none', 'important');
           }
         });
@@ -200,49 +187,16 @@
     return elementsToRestore;
   }
 
-  // UTILITY: Restore original styles and unhide elements.
-  function restoreVisuals(elementsToRestore) {
-    elementsToRestore.forEach(item => {
-      if (item.isFixed) {
-        // Restore display if it was hidden
-        if (item.originalDisplay) {
-          item.el.style.setProperty('display', item.originalDisplay, item.originalImportance);
-        } else {
-          item.el.style.removeProperty('display');
-        }
-        // Restore the base style text afterwards (this will remove the freeze)
-        item.el.style.cssText = item.originalStyle;
+  // Utility to restore elements
+  function restoreFixedElements(elementsToRestore) {
+    elementsToRestore.forEach(({ el, originalDisplay, originalImportance }) => {
+      // Restore original display style
+      if (originalDisplay) {
+        el.style.setProperty('display', originalDisplay, originalImportance);
       } else {
-        // Restore the original style text (removes the freeze)
-        item.el.style.cssText = item.originalStyle;
+        el.style.removeProperty('display');
       }
     });
-  }
-  
-  // UTILITY: Aggressive stabilization routine (Scrolls to bottom/up to trigger all lazy loading)
-  async function preStabilizeDOM(scrollingEl) {
-    console.log('Forcing full DOM render by scrolling to bottom to stabilize height...');
-    
-    // Find a target element at the bottom of the page
-    let bottomElement = document.querySelector('footer, .footer, #footer, body');
-    
-    if (!bottomElement) {
-        bottomElement = document.body;
-    }
-
-    // Use scrollIntoView to force the entire page contents to render
-    bottomElement.scrollIntoView({ behavior: 'auto', block: 'end' });
-    
-    // Wait for content to load, images to trigger, and DOM reflow to finish
-    await new Promise(r => setTimeout(r, PRE_SCROLL_STABILIZATION_MS));
-    
-    // Restore the scroll position to the very top before starting the capture
-    scrollingEl.scrollTo({ top: 0, left: 0, behavior: 'auto' });
-    
-    // Wait for the final scroll-up to settle
-    await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS));
-    
-    console.log('Pre-stabilization complete.');
   }
 
 
@@ -252,34 +206,38 @@
 
     const scrollingEl = document.scrollingElement || document.documentElement;
     const originalOverflow = scrollingEl.style.overflow;
-    const finalScrollRestore = scrollingEl.scrollTop;
+    const originalScrollTop = scrollingEl.scrollTop;
     
-    // 1. FREEZE VISUALS: Temporarily disable animations/transitions and hide fixed elements
-    const elementsToRestore = temporarilyFreezeVisuals(TARGET_ELEMENT_SELECTORS);
-    
-    // 2. Aggressive DOM Pre-Stabilization: Forces lazy content to render
-    await preStabilizeDOM(scrollingEl); 
+    // NOTE: elementsToRestore is now initialized here and populated *after* the first capture
+    let elementsToRestore = []; 
     
     const viewportHeight = window.innerHeight;
     const capturedDataUrls = [];
 
-    // Prevent main page jumps during capture
+    // Prevent page jumps during capture
     try {
       scrollingEl.style.overflow = 'hidden';
     } catch (e) {
       // ignore if cannot set
     }
     
-    // 3. Dynamic Scrolling Loop
+    // 2. Dynamic Scrolling Loop
     let currentScrollTop = 0;
     
     try {
-      // Wait once more after stabilization and scroll to top
+      // Scroll to the very top initially
+      scrollingEl.scrollTo({ top: 0, left: 0, behavior: 'auto' });
       await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS));
       
-      // Capture the first tile (y=0)
+      // Capture the first tile (y=0) while fixed elements are VISIBLE
       const dataUrl0 = await safeCapture();
       capturedDataUrls.push(dataUrl0);
+      
+      // --- MODIFICATION START ---
+      // 1. Identify and hide fixed/sticky elements ONLY NOW, after the first tile capture
+      elementsToRestore = hideFixedElements(FIXED_ELEMENT_SELECTORS);
+      // --- MODIFICATION END ---
+
 
       // Loop until we reach the bottom of the scrollable content
       while (true) {
@@ -288,7 +246,7 @@
 
         // Scroll to the target position
         scrollingEl.scrollTo({ top: targetScrollTop, left: 0, behavior: 'auto' });
-        await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS)); 
+        await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS));
 
         // Update current position after scroll (crucial for handling reflows)
         currentScrollTop = scrollingEl.scrollTop;
@@ -297,7 +255,7 @@
         const maxScrollTop = scrollingEl.scrollHeight - viewportHeight;
         const isAtBottom = currentScrollTop >= maxScrollTop;
 
-        // Capture the tile
+        // Capture the tile (fixed elements are now HIDDEN)
         const dataUrl = await safeCapture();
         capturedDataUrls.push(dataUrl);
 
@@ -312,17 +270,14 @@
       }
 
     } finally {
-      // 4. Cleanup: Restore original state
-      
       // Restore scroll/overflow
       try {
-        // Use the saved scroll top from before capture started
-        scrollingEl.scrollTo({ top: finalScrollRestore, left: 0, behavior: 'auto' }); 
+        scrollingEl.scrollTo({ top: originalScrollTop, left: 0, behavior: 'auto' });
         scrollingEl.style.overflow = originalOverflow;
       } catch (e) { /* ignore */ }
       
-      // Restore visuals (unhide elements and restore animations)
-      restoreVisuals(elementsToRestore);
+      // Restore fixed/sticky elements
+      restoreFixedElements(elementsToRestore);
     }
     
     // Load captured dataUrls into Image objects
@@ -338,9 +293,7 @@
       }
     }
 
-    if (images.length === 0) {
-      throw new Error('No captured images to stitch');
-    }
+    if (images.length === 0) throw new Error('No captured images to stitch');
 
     // Break into safe height batches
     const heightBatches = makeBatchesByHeight(images, MAX_CANVAS_HEIGHT);
@@ -418,9 +371,9 @@
 
     // Inform user (brief)
     if (outputs.length === 1) {
-      console.log(`Saved 1 file (${Math.round(outputs[0].blob.size / 1024 / 1024)} MB): ${base}_fullpage_${ts}.${outputs[0].ext}`);
+      alert(`Saved 1 file (${Math.round(outputs[0].blob.size / 1024 / 1024)} MB): ${base}_fullpage_${ts}.${outputs[0].ext}`);
     } else {
-      console.log(`Saved ${outputs.length} file(s).`);
+      alert(`Saved ${outputs.length} file(s).`);
     }
   }
 
