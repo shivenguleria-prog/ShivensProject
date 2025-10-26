@@ -3,6 +3,7 @@
 // MODIFIED: 
 // 1. Logic added to temporarily hide fixed/sticky headers during capture (CSS Override).
 // 2. Dynamic scrolling loop implemented to prevent content overlap from DOM reflows.
+// 3. CAPTURE_DELAY_MS increased to 900ms for better lazy-loading stabilization.
 // - No forced zoom, no hiding fixed/sticky elements
 // - Disables scrolling during capture and restores afterwards
 // - Encoding sequence per batch: JPG(0.97) -> JPG(0.95) -> WebP(0.97) -> WebP(0.92)
@@ -15,7 +16,7 @@
 
   // ---- Configuration ----
   const MAX_BYTES = 24 * 1024 * 1024; // 24 MB limit
-  const CAPTURE_DELAY_MS = 550;
+  const CAPTURE_DELAY_MS = 900;       // Adjusted delay for stabilization
   const CAPTURE_MAX_RETRIES = 3;
   const CAPTURE_RETRY_BASE_DELAY = 300;
 
@@ -29,7 +30,6 @@
   const MAX_CANVAS_HEIGHT = 30000; // px
 
   // --- STICKY/FIXED HEADER HIDING CONFIG ---
-  // IMPORTANT: You might need to adjust these selectors for the specific website.
   const FIXED_ELEMENT_SELECTORS = [
     'header',
     '.fixed',
@@ -239,7 +239,7 @@
 
         // Scroll to the target position
         scrollingEl.scrollTo({ top: targetScrollTop, left: 0, behavior: 'auto' });
-        await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS));
+        await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS)); // Wait for lazy load/reflow
 
         // Update current position after scroll (crucial for handling reflows)
         currentScrollTop = scrollingEl.scrollTop;
