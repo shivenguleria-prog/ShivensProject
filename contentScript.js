@@ -1,5 +1,6 @@
 // contentScript.js
-// Full-page capture with zoom, adaptive WebP, and automatic fixed-element detection/removal.
+// Full-page capture with zoom, adaptive WebP, and smart header handling
+// Keeps the header visible only in the first capture, hides it for the rest.
 
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
@@ -12,7 +13,7 @@
   const CAPTURE_RETRY_BASE_DELAY = 300;
   const WEBP_QUALITY_PRIMARY = 0.97;
   const WEBP_QUALITY_FALLBACK = 0.92;
-  const ZOOM_FACTOR = 0.8; // 80% zoom out
+  const ZOOM_FACTOR = 0.8; // Zoom out to 80%
   // ------------------------
 
   let lastCaptureTs = 0;
@@ -77,7 +78,6 @@
     URL.revokeObjectURL(url);
   }
 
-  // ---------- DETECT VISUALLY FIXED ELEMENTS ----------
   async function detectVisuallyFixedElements() {
     const scrollTest = 150;
     const fixedCandidates = Array.from(document.querySelectorAll("body *"))
@@ -118,7 +118,7 @@
       document.documentElement.style.zoom = String(ZOOM_FACTOR);
       await new Promise((r) => setTimeout(r, 150));
 
-      // 2️⃣ Detect visually fixed elements (including JS-based or transformed)
+      // 2️⃣ Detect visually fixed elements
       const visuallyFixed = await detectVisuallyFixedElements();
       const styleCache = visuallyFixed.map((el) => ({
         el,
@@ -128,6 +128,7 @@
           bottom: el.style.bottom,
           zIndex: el.style.zIndex,
           transform: el.style.transform,
+          display: el.style.display,
         },
       }));
 
@@ -139,16 +140,20 @@
         el.style.setProperty("transform", "none", "important");
       });
 
-      // 3️⃣ Measure after zoom
+      // 3️⃣ Find header element (common header selectors)
+      const header = document.querySelector(
+        "header, .header, #header, nav, .navbar, #navbar"
+      );
+
+      // 4️⃣ Measure after zoom
       const totalHeight = Math.max(
         document.documentElement.scrollHeight,
         document.body.scrollHeight
       );
       const viewportHeight = window.innerHeight;
-
       scrollingEl.style.overflow = "hidden";
 
-      // 4️⃣ Compute scroll positions (no overlap)
+      // 5️⃣ Compute scroll positions
       const positions = [];
       let y = 0;
       while (y < totalHeight - viewportHeight) {
@@ -157,19 +162,28 @@
       }
       positions.push(totalHeight - viewportHeight);
 
-      // 5️⃣ Capture
+      // 6️⃣ Capture loop
       const capturedDataUrls = [];
-      for (const pos of positions) {
+      for (let i = 0; i < positions.length; i++) {
+        const pos = positions[i];
         scrollingEl.scrollTo({ top: pos, left: 0, behavior: "instant" });
+
+        // 👇 Hide header after first capture
+        if (i === 1 && header) {
+          header.style.setProperty("display", "none", "important");
+        }
+
         await new Promise((r) => setTimeout(r, CAPTURE_DELAY_MS));
         const dataUrl = await safeCapture();
         capturedDataUrls.push(dataUrl);
       }
 
-      // 6️⃣ Restore scroll and styles
+      // 7️⃣ Restore scroll, overflow, zoom, header, and fixed styles
       scrollingEl.scrollTo({ top: originalScrollTop, left: 0, behavior: "instant" });
       scrollingEl.style.overflow = originalOverflow;
       document.documentElement.style.zoom = originalZoom;
+
+      if (header) header.style.display = styleCache.find(s => s.el === header)?.orig.display || "";
 
       for (const it of styleCache) {
         const s = it.el.style;
@@ -178,9 +192,10 @@
         s.bottom = it.orig.bottom || "";
         s.zIndex = it.orig.zIndex || "";
         s.transform = it.orig.transform || "";
+        s.display = it.orig.display || "";
       }
 
-      // 7️⃣ Load captures
+      // 8️⃣ Load captures
       const images = [];
       for (const d of capturedDataUrls) {
         const img = await loadImage(d);
@@ -204,7 +219,7 @@
         return { blob, width: w, height: h, mime };
       }
 
-      // 8️⃣ PNG first
+      // 9️⃣ Try PNG
       const { blob: pngBlob } = await stitchImages(images, "image/png");
       if (pngBlob.size <= MAX_BYTES) {
         saveBlob(pngBlob, "png");
@@ -212,7 +227,7 @@
         return;
       }
 
-      // 9️⃣ WebP at 0.97
+      // 🔟 Try WebP (0.97 → 0.92)
       const { blob: webp97 } = await stitchImages(images, "image/webp", WEBP_QUALITY_PRIMARY);
       if (webp97.size <= MAX_BYTES) {
         saveBlob(webp97, "webp");
@@ -220,7 +235,6 @@
         return;
       }
 
-      // 🔟 WebP at 0.92
       const { blob: webp92 } = await stitchImages(images, "image/webp", WEBP_QUALITY_FALLBACK);
       if (webp92.size <= MAX_BYTES) {
         saveBlob(webp92, "webp");
@@ -228,7 +242,7 @@
         return;
       }
 
-      // 11️⃣ Split if still too large
+      // 11️⃣ Split into batches
       const batches = [];
       let currentBatch = [];
       for (let i = 0; i < images.length; i++) {
@@ -250,7 +264,7 @@
         batches.push(blob);
       }
 
-      // 12️⃣ Save all batches
+      // 12️⃣ Save batches
       for (let i = 0; i < batches.length; i++) {
         let blob = batches[i];
         if (blob.size > MAX_BYTES) {
