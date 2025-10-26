@@ -1,13 +1,14 @@
 // contentScript.js
 // Full-page capture script
-// FINAL VERSION: Incorporates CSS Freeze and Aggressive Pre-Stabilization for maximum stability.
+// FINAL RESOLUTION: Implements targeted visual freeze and increased stabilization time.
 // 
 // MODIFICATIONS SUMMARY: 
-// 1. **CRITICAL FIX**: Implemented a global CSS freeze to disable all transitions and animations
-//    during capture, eliminating content toggling and mismatch between tiles.
-// 2. Aggressive "Scroll to Bottom" technique used to force all lazy content to render.
-// 3. Dynamic scrolling loop maintained to handle main page reflows.
-// 4. CAPTURE_DELAY_MS kept at 550ms.
+// 1. **REFINED FIX**: Reverted to selective element manipulation but added inline styles
+//    to freeze transitions/animations on fixed/sticky elements to prevent "toggling."
+// 2. **INCREASED STABILITY DELAY**: PRE_SCROLL_STABILIZATION_MS increased to 1500ms.
+// 3. Selective Fixed/Sticky Element Hiding is maintained.
+// 4. Dynamic scrolling loop maintained.
+// 5. CAPTURE_DELAY_MS kept at 550ms.
 
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
@@ -15,10 +16,11 @@
 
   // ---- Configuration ----
   const MAX_BYTES = 24 * 1024 * 1024; // 24 MB limit
-  const CAPTURE_DELAY_MS = 550;       // Kept at 550ms
+  const CAPTURE_DELAY_MS = 550;       // Kept at 550ms (delay between scroll and capture)
   const CAPTURE_MAX_RETRIES = 3;
   const CAPTURE_RETRY_BASE_DELAY = 300;
-  const PRE_SCROLL_STABILIZATION_MS = 1000; // Dedicated wait after forcing content load
+  // Increased stabilization wait time after aggressive scroll-to-bottom
+  const PRE_SCROLL_STABILIZATION_MS = 1500; 
 
   // Encoding qualities
   const JPEG_QUALITY_HIGH = 0.97;
@@ -29,8 +31,20 @@
   // Safe canvas max height to avoid browser limits
   const MAX_CANVAS_HEIGHT = 30000; // px
 
-  // ID for the temporary style element used for the CSS freeze
-  const FREEZE_STYLE_ID = '__fullpage_capture_freeze';
+  // --- ELEMENTS TO MANIPULATE (Fixed/Sticky elements that repeat or cause animation issues) ---
+  const TARGET_ELEMENT_SELECTORS = [
+    'header', 
+    'footer', 
+    '.fixed',
+    '.sticky',
+    '[style*="position: fixed"]',
+    '[style*="position: sticky"]',
+    '#header', 
+    '#fixed-bar',
+    '.animated', // Catch common animation classes
+    '[class*="slide"]' // Catch common carousel/slider/tab classes
+  ];
+  // ------------------------------------------------------------------------------------------
 
   let lastCaptureTs = 0;
 
@@ -147,38 +161,62 @@
     return { blob, width: w, height: h, mime };
   }
   
-  // UTILITY: Apply the CSS freeze rule (Disables animations, transitions, and fixed/sticky)
-  function applyFreezeStyle() {
-    let styleEl = document.getElementById(FREEZE_STYLE_ID);
-    if (styleEl) return;
-
-    styleEl = document.createElement('style');
-    styleEl.id = FREEZE_STYLE_ID;
+  // UTILITY: Temporarily freezes transitions/animations AND hides fixed elements.
+  function temporarilyFreezeVisuals(selectors) {
+    const elementsToRestore = [];
     
-    // Aggressive CSS rule to halt all motion and positioning tied to viewport
-    styleEl.textContent = `
-      *, ::before, ::after {
-        transition: none !important;
-        animation: none !important;
-        scroll-behavior: auto !important;
-        /* Force fixed/sticky elements to static position (handles header repetition) */
-        position: static !important;
-        top: auto !important;
-        bottom: auto !important;
-        left: auto !important;
-        right: auto !important;
-        transform: none !important;
+    // Inline style overrides to freeze transitions and animations
+    const FREEZE_STYLE = 'transition: none !important; animation: none !important;';
+
+    for (const selector of selectors) {
+      try {
+        const elements = document.querySelectorAll(selector);
+        elements.forEach(el => {
+          const style = window.getComputedStyle(el);
+          const position = style.getPropertyValue('position');
+
+          let isFixed = position === 'fixed' || position === 'sticky';
+          
+          // --- 1. Freeze Visual Movement ---
+          const originalStyle = el.style.cssText;
+          elementsToRestore.push({ el, originalStyle });
+          el.style.cssText += FREEZE_STYLE; // Append the freeze styles
+
+          // --- 2. Hide Fixed Elements (only if fixed/sticky) ---
+          if (isFixed) {
+            const originalDisplay = el.style.getPropertyValue('display');
+            const originalImportance = el.style.getPropertyPriority('display');
+            
+            // Overwrite display only if it was fixed/sticky
+            elementsToRestore.pop(); // Remove the push above to replace it with a more specific restore object
+            elementsToRestore.push({ el, originalStyle, isFixed: true, originalDisplay, originalImportance });
+            el.style.setProperty('display', 'none', 'important');
+          }
+        });
+      } catch (e) {
+        console.warn(`Error querying selector '${selector}':`, e);
       }
-    `;
-    document.head.appendChild(styleEl);
+    }
+    return elementsToRestore;
   }
 
-  // UTILITY: Remove the CSS freeze rule
-  function removeFreezeStyle() {
-    const styleEl = document.getElementById(FREEZE_STYLE_ID);
-    if (styleEl) {
-      styleEl.remove();
-    }
+  // UTILITY: Restore original styles and unhide elements.
+  function restoreVisuals(elementsToRestore) {
+    elementsToRestore.forEach(item => {
+      if (item.isFixed) {
+        // Restore display if it was hidden
+        if (item.originalDisplay) {
+          item.el.style.setProperty('display', item.originalDisplay, item.originalImportance);
+        } else {
+          item.el.style.removeProperty('display');
+        }
+        // Restore the base style text afterwards (this will remove the freeze)
+        item.el.style.cssText = item.originalStyle;
+      } else {
+        // Restore the original style text (removes the freeze)
+        item.el.style.cssText = item.originalStyle;
+      }
+    });
   }
   
   // UTILITY: Aggressive stabilization routine (Scrolls to bottom/up to trigger all lazy loading)
@@ -216,8 +254,8 @@
     const originalOverflow = scrollingEl.style.overflow;
     const finalScrollRestore = scrollingEl.scrollTop;
     
-    // 1. CRITICAL: Apply the global CSS freeze to prevent all animation/transition state changes
-    applyFreezeStyle();
+    // 1. FREEZE VISUALS: Temporarily disable animations/transitions and hide fixed elements
+    const elementsToRestore = temporarilyFreezeVisuals(TARGET_ELEMENT_SELECTORS);
     
     // 2. Aggressive DOM Pre-Stabilization: Forces lazy content to render
     await preStabilizeDOM(scrollingEl); 
@@ -283,8 +321,8 @@
         scrollingEl.style.overflow = originalOverflow;
       } catch (e) { /* ignore */ }
       
-      // Remove the global CSS freeze style
-      removeFreezeStyle();
+      // Restore visuals (unhide elements and restore animations)
+      restoreVisuals(elementsToRestore);
     }
     
     // Load captured dataUrls into Image objects
@@ -300,7 +338,9 @@
       }
     }
 
-    if (images.length === 0) throw new Error('No captured images to stitch');
+    if (images.length === 0) {
+      throw new Error('No captured images to stitch');
+    }
 
     // Break into safe height batches
     const heightBatches = makeBatchesByHeight(images, MAX_CANVAS_HEIGHT);
