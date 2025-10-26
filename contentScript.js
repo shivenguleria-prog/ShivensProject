@@ -1,6 +1,12 @@
 // contentScript.js
-// Full-page capture with zoom, adaptive WebP, and smart header handling
-// Keeps the header visible only in the first capture, hides it for the rest.
+// Full-page capture with:
+// - Zoom-out scaling
+// - PNG -> WebP(primary 0.97) -> WebP(fallback 0.92) -> split if >19MB
+// - Fixed/sticky and JS-pinned headers handled
+// - Option 1: temporarily disable site scroll JS (prevents site from re-sticking header during programmatic scroll)
+// - Precise scroll positions computed after zoom
+//
+// Drop this into your extension (replace existing contentScript.js)
 
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
@@ -13,7 +19,7 @@
   const CAPTURE_RETRY_BASE_DELAY = 300;
   const WEBP_QUALITY_PRIMARY = 0.97;
   const WEBP_QUALITY_FALLBACK = 0.92;
-  const ZOOM_FACTOR = 0.8; // Zoom out to 80%
+  const ZOOM_FACTOR = 0.8; // 80% zoom out
   // ------------------------
 
   let lastCaptureTs = 0;
@@ -56,7 +62,7 @@
     return new Promise((resolve, reject) => {
       const img = new Image();
       img.onload = () => resolve(img);
-      img.onerror = reject;
+      img.onerror = (e) => reject(new Error("Image load failed: " + e));
       img.src = dataUrl;
     });
   }
@@ -78,13 +84,135 @@
     URL.revokeObjectURL(url);
   }
 
+  // ---------- SITE SCROLL-JS DISABLER (Option 1) ----------
+  // This tries to prevent site JS from reacting to programmatic scrolls.
+  // Strategy:
+  // 1) Backup and null window.onscroll / document.onscroll
+  // 2) Install capture-phase listeners that stop propagation for scroll/wheel/touch/pointer
+  // 3) Override EventTarget.prototype.addEventListener temporarily to block new scroll/wheel listeners
+  // 4) Temporarily override IntersectionObserver.observe to noop (prevents some observers reacting)
+  //
+  // Restore everything after capture.
+
+  const siteDisableState = {
+    backed: false,
+    backup: {},
+    blockerListeners: [],
+  };
+
+  function disableSiteScrollJS() {
+    if (siteDisableState.backed) return;
+    siteDisableState.backed = true;
+
+    // backup simple properties
+    siteDisableState.backup.windowOnScroll = window.onscroll;
+    siteDisableState.backup.documentOnScroll = document.onscroll;
+
+    try {
+      window.onscroll = null;
+    } catch (e) {}
+    try {
+      document.onscroll = null;
+    } catch (e) {}
+
+    // override addEventListener to prevent new scroll-related listeners
+    siteDisableState.backup.addEventListener = EventTarget.prototype.addEventListener;
+    siteDisableState.backup.removeEventListener = EventTarget.prototype.removeEventListener;
+
+    EventTarget.prototype.addEventListener = function (type, listener, options) {
+      const blocked = /^(scroll|wheel|touchstart|touchmove|touchend|pointermove|mousewheel)$/i;
+      if (blocked.test(type)) {
+        // swallow adding scroll-related listener while disabled
+        return;
+      }
+      return siteDisableState.backup.addEventListener.call(this, type, listener, options);
+    };
+
+    EventTarget.prototype.removeEventListener = function (type, listener, options) {
+      // allow normal removal (use original remove)
+      return siteDisableState.backup.removeEventListener.call(this, type, listener, options);
+    };
+
+    // Add capture-phase blockers that stop propagation of scroll-like events
+    const blockTypes = ["scroll", "wheel", "touchmove", "pointermove", "mousewheel", "touchstart", "touchend"];
+    blockTypes.forEach((t) => {
+      const handler = function (e) {
+        // prevent site handlers from receiving these events (capture phase)
+        try {
+          e.stopImmediatePropagation();
+        } catch (err) {}
+        // Don't preventDefault for scroll events to avoid breaking scrollTo behavior
+      };
+      window.addEventListener(t, handler, { capture: true, passive: false });
+      document.addEventListener(t, handler, { capture: true, passive: false });
+      siteDisableState.blockerListeners.push({ type: t, handler });
+    });
+
+    // Override IntersectionObserver.observe to noop temporarily (some sites use it to change header)
+    siteDisableState.backup.IntersectionObserver = window.IntersectionObserver;
+    try {
+      window.IntersectionObserver = class {
+        constructor() {}
+        observe() {}
+        unobserve() {}
+        disconnect() {}
+      };
+    } catch (e) {
+      // ignore
+    }
+
+    // Also attempt to pause requestAnimationFrame-driven scripts by wrapping raf? (We won't override raf; it's risky)
+    // For many sites this will be sufficient.
+  }
+
+  function restoreSiteScrollJS() {
+    if (!siteDisableState.backed) return;
+    siteDisableState.backed = false;
+
+    try {
+      window.onscroll = siteDisableState.backup.windowOnScroll;
+    } catch (e) {}
+    try {
+      document.onscroll = siteDisableState.backup.documentOnScroll;
+    } catch (e) {}
+
+    // restore addEventListener/removeEventListener
+    if (siteDisableState.backup.addEventListener) {
+      EventTarget.prototype.addEventListener = siteDisableState.backup.addEventListener;
+    }
+    if (siteDisableState.backup.removeEventListener) {
+      EventTarget.prototype.removeEventListener = siteDisableState.backup.removeEventListener;
+    }
+
+    // remove blocker listeners
+    siteDisableState.blockerListeners.forEach(({ type, handler }) => {
+      try {
+        window.removeEventListener(type, handler, { capture: true });
+      } catch (e) {}
+      try {
+        document.removeEventListener(type, handler, { capture: true });
+      } catch (e) {}
+    });
+    siteDisableState.blockerListeners = [];
+
+    // restore IntersectionObserver
+    if (siteDisableState.backup.IntersectionObserver) {
+      try {
+        window.IntersectionObserver = siteDisableState.backup.IntersectionObserver;
+      } catch (e) {}
+    }
+
+    siteDisableState.backup = {};
+  }
+
+  // ---------- DETECT VISUALLY FIXED ELEMENTS (kept but run after we disable site scripts) ----------
   async function detectVisuallyFixedElements() {
     const scrollTest = 150;
-    const fixedCandidates = Array.from(document.querySelectorAll("body *"))
-      .filter((el) => el.offsetParent !== null && el.getClientRects().length);
+    const allEls = Array.from(document.querySelectorAll("body *"));
+    const candidates = allEls.filter((el) => el.offsetParent !== null && el.getClientRects().length);
 
     const beforePositions = new Map();
-    for (const el of fixedCandidates) {
+    for (const el of candidates) {
       beforePositions.set(el, el.getBoundingClientRect().top);
     }
 
@@ -92,7 +220,7 @@
     await new Promise((r) => setTimeout(r, 120));
 
     const fixedDetected = [];
-    for (const el of fixedCandidates) {
+    for (const el of candidates) {
       const beforeTop = beforePositions.get(el);
       const afterTop = el.getBoundingClientRect().top;
       if (Math.abs(afterTop - beforeTop) < 1) fixedDetected.push(el);
@@ -113,14 +241,23 @@
     const originalScrollTop = scrollingEl.scrollTop;
     const originalZoom = document.documentElement.style.zoom || "";
 
-    try {
-      // 1️⃣ Apply zoom
-      document.documentElement.style.zoom = String(ZOOM_FACTOR);
-      await new Promise((r) => setTimeout(r, 150));
+    // We'll cache modified elements to restore later
+    let styleCache = [];
+    let visuallyFixed = [];
 
-      // 2️⃣ Detect visually fixed elements
-      const visuallyFixed = await detectVisuallyFixedElements();
-      const styleCache = visuallyFixed.map((el) => ({
+    try {
+      // 0) Disable site scroll JS aggressively (Option 1)
+      disableSiteScrollJS();
+
+      // 1) Apply zoom (before measuring)
+      document.documentElement.style.zoom = String(ZOOM_FACTOR);
+      await new Promise((r) => setTimeout(r, 150)); // allow reflow
+
+      // 2) Detect visually fixed elements now that site scroll handlers are mostly disabled
+      visuallyFixed = await detectVisuallyFixedElements();
+
+      // 3) Cache and force them to normal flow
+      styleCache = visuallyFixed.map((el) => ({
         el,
         orig: {
           position: el.style.position,
@@ -131,71 +268,82 @@
           display: el.style.display,
         },
       }));
-
       visuallyFixed.forEach((el) => {
-        el.style.setProperty("position", "static", "important");
-        el.style.setProperty("top", "auto", "important");
-        el.style.setProperty("bottom", "auto", "important");
-        el.style.setProperty("z-index", "auto", "important");
-        el.style.setProperty("transform", "none", "important");
+        try {
+          el.style.setProperty("position", "static", "important");
+          el.style.setProperty("top", "auto", "important");
+          el.style.setProperty("bottom", "auto", "important");
+          el.style.setProperty("z-index", "auto", "important");
+          el.style.setProperty("transform", "none", "important");
+          // ensure it's visible in normal flow
+          if (getComputedStyle(el).display === "none") {
+            el.style.setProperty("display", "block", "important");
+          }
+        } catch (e) {
+          // ignore
+        }
       });
 
-      // 3️⃣ Find header element (common header selectors)
-      const header = document.querySelector(
-        "header, .header, #header, nav, .navbar, #navbar"
-      );
-
-      // 4️⃣ Measure after zoom
+      // 4) Measure after zoom & adjustments
       const totalHeight = Math.max(
         document.documentElement.scrollHeight,
         document.body.scrollHeight
       );
       const viewportHeight = window.innerHeight;
+
       scrollingEl.style.overflow = "hidden";
 
-      // 5️⃣ Compute scroll positions
+      // 5) Compute scroll positions (no overlap)
       const positions = [];
       let y = 0;
       while (y < totalHeight - viewportHeight) {
         positions.push(Math.round(y));
         y += viewportHeight;
       }
-      positions.push(totalHeight - viewportHeight);
+      positions.push(Math.max(0, totalHeight - viewportHeight));
 
-      // 6️⃣ Capture loop
+      // 6) Capture each viewport
       const capturedDataUrls = [];
-      for (let i = 0; i < positions.length; i++) {
-        const pos = positions[i];
+      for (const pos of positions) {
         scrollingEl.scrollTo({ top: pos, left: 0, behavior: "instant" });
-
-        // 👇 Hide header after first capture
-        if (i === 1 && header) {
-          header.style.setProperty("display", "none", "important");
+        await new Promise((r) => setTimeout(r, CAPTURE_DELAY_MS));
+        // Re-apply forced styles each iteration as a safety (in case some inline script slipped through)
+        for (const it of styleCache) {
+          try {
+            it.el.style.setProperty("position", "static", "important");
+            it.el.style.setProperty("transform", "none", "important");
+            it.el.style.setProperty("top", "auto", "important");
+            it.el.style.setProperty("bottom", "auto", "important");
+            it.el.style.setProperty("z-index", "auto", "important");
+          } catch (e) {}
         }
 
-        await new Promise((r) => setTimeout(r, CAPTURE_DELAY_MS));
         const dataUrl = await safeCapture();
         capturedDataUrls.push(dataUrl);
       }
 
-      // 7️⃣ Restore scroll, overflow, zoom, header, and fixed styles
+      // 7) Restore DOM (scroll, overflow, zoom) BEFORE stitching
       scrollingEl.scrollTo({ top: originalScrollTop, left: 0, behavior: "instant" });
       scrollingEl.style.overflow = originalOverflow;
       document.documentElement.style.zoom = originalZoom;
 
-      if (header) header.style.display = styleCache.find(s => s.el === header)?.orig.display || "";
-
+      // Restore visually-fixed elements' styles
       for (const it of styleCache) {
-        const s = it.el.style;
-        s.position = it.orig.position || "";
-        s.top = it.orig.top || "";
-        s.bottom = it.orig.bottom || "";
-        s.zIndex = it.orig.zIndex || "";
-        s.transform = it.orig.transform || "";
-        s.display = it.orig.display || "";
+        try {
+          const s = it.el.style;
+          s.position = it.orig.position || "";
+          s.top = it.orig.top || "";
+          s.bottom = it.orig.bottom || "";
+          s.zIndex = it.orig.zIndex || "";
+          s.transform = it.orig.transform || "";
+          s.display = it.orig.display || "";
+        } catch (e) {}
       }
 
-      // 8️⃣ Load captures
+      // 8) Restore site JS handlers
+      restoreSiteScrollJS();
+
+      // 9) Load all captures as images
       const images = [];
       for (const d of capturedDataUrls) {
         const img = await loadImage(d);
@@ -219,7 +367,7 @@
         return { blob, width: w, height: h, mime };
       }
 
-      // 9️⃣ Try PNG
+      // 10) PNG first
       const { blob: pngBlob } = await stitchImages(images, "image/png");
       if (pngBlob.size <= MAX_BYTES) {
         saveBlob(pngBlob, "png");
@@ -227,22 +375,23 @@
         return;
       }
 
-      // 🔟 Try WebP (0.97 → 0.92)
-      const { blob: webp97 } = await stitchImages(images, "image/webp", WEBP_QUALITY_PRIMARY);
-      if (webp97.size <= MAX_BYTES) {
-        saveBlob(webp97, "webp");
-        alert("Saved as WebP (quality 0.97)");
+      // 11) WebP primary
+      const { blob: webpPrimary } = await stitchImages(images, "image/webp", WEBP_QUALITY_PRIMARY);
+      if (webpPrimary.size <= MAX_BYTES) {
+        saveBlob(webpPrimary, "webp");
+        alert("Saved as WebP (quality " + WEBP_QUALITY_PRIMARY + ")");
         return;
       }
 
-      const { blob: webp92 } = await stitchImages(images, "image/webp", WEBP_QUALITY_FALLBACK);
-      if (webp92.size <= MAX_BYTES) {
-        saveBlob(webp92, "webp");
-        alert("Saved as WebP (quality 0.92)");
+      // 12) WebP fallback
+      const { blob: webpFallback } = await stitchImages(images, "image/webp", WEBP_QUALITY_FALLBACK);
+      if (webpFallback.size <= MAX_BYTES) {
+        saveBlob(webpFallback, "webp");
+        alert("Saved as WebP (quality " + WEBP_QUALITY_FALLBACK + ")");
         return;
       }
 
-      // 11️⃣ Split into batches
+      // 13) Split into batches (try primary then fallback per batch)
       const batches = [];
       let currentBatch = [];
       for (let i = 0; i < images.length; i++) {
@@ -254,43 +403,66 @@
         } else {
           if (currentBatch.length > 0) {
             const { blob } = await stitchImages(currentBatch, "image/webp", WEBP_QUALITY_PRIMARY);
-            batches.push(blob);
+            batches.push({ items: currentBatch.slice(), blobPrimary: blob });
           }
           currentBatch = [candidate];
+          // If single candidate is already too large at primary, we'll push it and handle fallback later
+          const { blob: singleTest } = await stitchImages(currentBatch, "image/webp", WEBP_QUALITY_PRIMARY);
+          if (singleTest.size > MAX_BYTES) {
+            batches.push({ items: currentBatch.slice(), blobPrimary: singleTest });
+            currentBatch = [];
+          }
         }
       }
       if (currentBatch.length > 0) {
         const { blob } = await stitchImages(currentBatch, "image/webp", WEBP_QUALITY_PRIMARY);
-        batches.push(blob);
+        batches.push({ items: currentBatch.slice(), blobPrimary: blob });
       }
 
-      // 12️⃣ Save batches
+      // 14) Save each batch
       for (let i = 0; i < batches.length; i++) {
-        let blob = batches[i];
-        if (blob.size > MAX_BYTES) {
-          const { blob: fallback } = await stitchImages(
-            [images[i]],
-            "image/webp",
-            WEBP_QUALITY_FALLBACK
-          );
-          blob = fallback;
+        const b = batches[i];
+        if (b.blobPrimary && b.blobPrimary.size <= MAX_BYTES) {
+          saveBlob(b.blobPrimary, "webp", i + 1);
+          continue;
         }
-        saveBlob(blob, "webp", i + 1);
+        const { blob: bf } = await stitchImages(b.items, "image/webp", WEBP_QUALITY_FALLBACK);
+        if (bf.size <= MAX_BYTES) {
+          saveBlob(bf, "webp", i + 1);
+        } else {
+          // last resort: save fallback even if > MAX_BYTES
+          saveBlob(bf, "webp", i + 1);
+          console.warn(`Saved batch ${i + 1} but it still exceeds ${MAX_BYTES} bytes.`);
+        }
       }
 
-      alert(`Saved as ${batches.length} WebP image(s) (each ≤19MB)`);
-
-      // Helper
-      function saveBlob(blob, ext, index = 0) {
-        const base = new URL(location.href).hostname.replace(/\./g, "_");
-        const name = index ? `${base}_part${index}.${ext}` : `${base}_fullpage.${ext}`;
-        downloadBlob(blob, name);
-      }
+      alert(`Saved as ${batches.length} WebP image(s) (attempted ${WEBP_QUALITY_PRIMARY} then ${WEBP_QUALITY_FALLBACK})`);
     } catch (err) {
+      // attempt cleanup
+      try { document.documentElement.style.zoom = originalZoom; } catch (e) {}
+      try { scrollingEl.style.overflow = originalOverflow; } catch (e) {}
+      try { scrollingEl.scrollTo({ top: originalScrollTop, left: 0, behavior: "instant" }); } catch (e) {}
+      try {
+        for (const it of styleCache) {
+          const s = it.el.style;
+          s.position = it.orig.position || "";
+          s.top = it.orig.top || "";
+          s.bottom = it.orig.bottom || "";
+          s.zIndex = it.orig.zIndex || "";
+          s.transform = it.orig.transform || "";
+          s.display = it.orig.display || "";
+        }
+      } catch (e) {}
+      try { restoreSiteScrollJS(); } catch (e) {}
       console.error(err);
-      alert("Capture failed: " + err.message);
-      try { document.documentElement.style.zoom = originalZoom; } catch {}
-      try { scrollingEl.style.overflow = originalOverflow; } catch {}
+      alert("Capture failed: " + (err && err.message ? err.message : err));
     }
+  }
+
+  // Helper: save blob
+  function saveBlob(blob, ext, index = 0) {
+    const base = new URL(location.href).hostname.replace(/\./g, "_");
+    const name = index ? `${base}_part${index}.${ext}` : `${base}_fullpage.${ext}`;
+    downloadBlob(blob, name);
   }
 })();
