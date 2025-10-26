@@ -1,10 +1,10 @@
 // contentScript.js
 // Full-page capture script
 // MODIFIED: 
-// 1. Logic adjusted to hide fixed/sticky headers *after* the first tile capture, 
-//    ensuring the header is present in the first screenshot tile.
-// 2. EXPANDED FIXED_ELEMENT_SELECTORS to target more common header classes/IDs.
-// 3. Dynamic scrolling loop implemented to prevent content overlap from DOM reflows.
+// 1. Logic added to measure the fixed header height and apply a vertical scroll 
+//    offset correction to prevent content cut-off/jump after hiding the header.
+// 2. Logic adjusted to hide fixed/sticky headers *after* the first tile capture.
+// 3. EXPANDED FIXED_ELEMENT_SELECTORS to target more common header classes/IDs.
 // - No forced zoom, no hiding fixed/sticky elements
 // - Disables scrolling during capture and restores afterwards
 // - Encoding sequence per batch: JPG(0.97) -> JPG(0.95) -> WebP(0.97) -> WebP(0.92)
@@ -48,12 +48,12 @@
     '[style*="position: sticky"]',
 
     // 3. Common/Framework-Specific Classes
-    '.navbar-fixed-top',    // Common Bootstrap/framework class
+    '.navbar-fixed-top',    
     '.navbar-sticky',       
     '.header-fixed',        
-    '.is-fixed',            // State-based class often added by JS
-    '.is-sticky',           // State-based class often added by JS
-    '.sticky-top',          // Bootstrap 4+ class
+    '.is-fixed',            
+    '.is-sticky',           
+    '.sticky-top',          
 
     // 4. Common High Z-Index Overrides (Use with caution - targets overlays)
     '[style*="z-index: 1000"]',
@@ -179,20 +179,32 @@
     return { blob, width: w, height: h, mime };
   }
   
-  // Utility to collect and temporarily hide fixed elements
+  // Utility to collect and temporarily hide fixed elements, returning the total height of hidden elements
   function hideFixedElements(selectors) {
     const elementsToRestore = [];
+    let totalHeight = 0;
+
     for (const selector of selectors) {
       try {
         const elements = document.querySelectorAll(selector);
         elements.forEach(el => {
-          // Check for fixed/sticky position or high z-index before hiding
           const style = window.getComputedStyle(el);
           const position = style.getPropertyValue('position');
           const zIndex = style.getPropertyValue('z-index');
 
-          // Only proceed if the element is actually fixed/sticky OR has a high z-index
+          // Check for fixed/sticky position OR high z-index
           if (position === 'fixed' || position === 'sticky' || (zIndex !== 'auto' && parseInt(zIndex) >= 1000)) {
+            // Check if this element has already been processed (e.g., via a different selector)
+            if (elementsToRestore.some(item => item.el === el)) return;
+
+            // Only count the height of elements that are FIXED to the TOP of the viewport
+            // to avoid calculating elements fixed to the bottom or middle (like a chat button).
+            const topValue = parseFloat(style.getPropertyValue('top'));
+            if (position === 'fixed' && topValue < 50) { // arbitrary threshold of 50px from top
+                const rect = el.getBoundingClientRect();
+                totalHeight += rect.height;
+            }
+
             const originalDisplay = el.style.getPropertyValue('display');
             const originalImportance = el.style.getPropertyPriority('display');
             
@@ -206,7 +218,7 @@
         console.warn(`Error querying selector '${selector}':`, e);
       }
     }
-    return elementsToRestore;
+    return { elementsToRestore, totalHeight };
   }
 
   // Utility to restore elements
@@ -230,8 +242,8 @@
     const originalOverflow = scrollingEl.style.overflow;
     const originalScrollTop = scrollingEl.scrollTop;
     
-    // elementsToRestore is now initialized here and populated *after* the first capture
     let elementsToRestore = []; 
+    let offsetCorrection = 0; // The calculated height of the fixed headers
     
     const viewportHeight = window.innerHeight;
     const capturedDataUrls = [];
@@ -255,10 +267,20 @@
       const dataUrl0 = await safeCapture();
       capturedDataUrls.push(dataUrl0);
       
-      // 1. Identify and hide fixed/sticky elements ONLY NOW, after the first tile capture
-      elementsToRestore = hideFixedElements(FIXED_ELEMENT_SELECTORS);
+      // 1. Identify, measure, and hide fixed/sticky elements ONLY NOW
+      const hideResult = hideFixedElements(FIXED_ELEMENT_SELECTORS);
+      elementsToRestore = hideResult.elementsToRestore;
+      offsetCorrection = hideResult.totalHeight;
       
+      // *** FIX FOR CONTENT JUMP ***
+      // Adjust the scroll position backwards by the height of the now-hidden header.
+      // This pulls the main content up to where it should be, eliminating the cut-off.
+      scrollingEl.scrollTo({ top: scrollingEl.scrollTop - offsetCorrection, left: 0, behavior: 'auto' });
+      await new Promise(r => setTimeout(r, 100)); // Short delay for scroll adjustment
 
+      // Update current position after correction
+      currentScrollTop = scrollingEl.scrollTop;
+      
       // Loop until we reach the bottom of the scrollable content
       while (true) {
         // Calculate next target position
@@ -275,7 +297,7 @@
         const maxScrollTop = scrollingEl.scrollHeight - viewportHeight;
         const isAtBottom = currentScrollTop >= maxScrollTop;
 
-        // Capture the tile (fixed elements are now HIDDEN)
+        // Capture the tile (fixed elements are now HIDDEN and content is correctly offset)
         const dataUrl = await safeCapture();
         capturedDataUrls.push(dataUrl);
 
