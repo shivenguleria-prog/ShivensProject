@@ -1,8 +1,10 @@
-// contentScript_fullpage_capture_zoomed.js
-// Full-page capture script (without forced zoom).
-// - Save as JPG first (0.97 → 0.95)
-// - If both exceed 24MB, try WebP (0.97 → 0.92)
-// - Scroll positions and measurements are calculated normally
+// contentScript.js
+// Full-page capture script
+// - No forced zoom, no hiding fixed/sticky elements
+// - Disables scrolling during capture and restores afterwards
+// - Encoding sequence per batch: JPG(0.97) -> JPG(0.95) -> WebP(0.97) -> WebP(0.92)
+// - Max per-file size: 24 MB
+// - Uses background message { action: 'capture-visible' } to get visible capture dataUrl
 
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
@@ -14,11 +16,15 @@
   const CAPTURE_MAX_RETRIES = 3;
   const CAPTURE_RETRY_BASE_DELAY = 300;
 
-  // Output preferences
-  const JPEG_QUALITY_HIGH = 0.97; // first attempt for JPEG
-  const JPEG_QUALITY = 0.95; // second attempt for JPEG if high exceeds limit
-  const WEBP_QUALITY_HIGH = 0.97; // fallback 1 for WebP
-  const WEBP_QUALITY_FALLBACK = 0.92; // fallback 2 (assumed to be <= MAX_BYTES)
+  // Encoding qualities
+  const JPEG_QUALITY_HIGH = 0.97; // first try JPG
+  const JPEG_QUALITY = 0.95;      // second try JPG
+  const WEBP_QUALITY_HIGH = 0.97; // third try WebP
+  const WEBP_QUALITY_FALLBACK = 0.92; // final try WebP
+
+  // Safe canvas max height to avoid browser limits (tweak if needed)
+  const MAX_CANVAS_HEIGHT = 30000; // px
+
   // ------------------------
 
   let lastCaptureTs = 0;
@@ -42,11 +48,15 @@
 
     for (let attempt = 1; attempt <= CAPTURE_MAX_RETRIES; attempt++) {
       const res = await new Promise(resolve => {
-        chrome.runtime.sendMessage({ action: 'capture-visible' }, resolve);
+        try {
+          chrome.runtime.sendMessage({ action: 'capture-visible' }, resolve);
+        } catch (err) {
+          resolve({ success: false, error: err && err.message });
+        }
       });
       lastCaptureTs = Date.now();
 
-      if (res && res.success) return res.dataUrl;
+      if (res && res.success && res.dataUrl) return res.dataUrl;
       if (attempt === CAPTURE_MAX_RETRIES) {
         const errMsg = res?.error || 'Unknown capture error';
         throw new Error(`capture failed: ${errMsg}`);
@@ -61,13 +71,14 @@
     return new Promise((resolve, reject) => {
       const img = new Image();
       img.onload = () => resolve(img);
-      img.onerror = reject;
+      img.onerror = (e) => reject(new Error('Image load error'));
       img.src = dataUrl;
     });
   }
 
   function canvasToBlob(canvas, type = 'image/jpeg', quality = 0.95) {
     return new Promise((resolve) => {
+      // toBlob may provide null in rare cases; resolve null to be checked by caller
       canvas.toBlob(blob => resolve(blob), type, quality);
     });
   }
@@ -80,10 +91,61 @@
     document.body.appendChild(a);
     a.click();
     a.remove();
-    URL.revokeObjectURL(url);
+    // revoke after short delay to ensure download has started
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  // ---------------- MAIN ----------------
+  function timestamp() {
+    return (new Date()).toISOString().replace(/[:.]/g, '-');
+  }
+
+  // Split images into height-constrained batches to avoid huge canvases
+  function makeBatchesByHeight(images, maxHeight = MAX_CANVAS_HEIGHT) {
+    const batches = [];
+    let current = [];
+    let currentH = 0;
+    for (const img of images) {
+      // If single tile exceeds maxHeight, still put it in its own batch (risk-y but necessary)
+      if (img.height > maxHeight) {
+        if (current.length) {
+          batches.push(current);
+          current = [];
+          currentH = 0;
+        }
+        batches.push([img]);
+        continue;
+      }
+      if (currentH + img.height > maxHeight) {
+        if (current.length) batches.push(current);
+        current = [img];
+        currentH = img.height;
+      } else {
+        current.push(img);
+        currentH += img.height;
+      }
+    }
+    if (current.length) batches.push(current);
+    return batches;
+  }
+
+  // Stitch an array of image items vertically into a canvas blob
+  async function stitchImagesToBlob(imgItems, mime = 'image/jpeg', quality = 0.95) {
+    const w = Math.max(...imgItems.map(i => i.width));
+    const h = imgItems.reduce((s, i) => s + i.height, 0);
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    let y = 0;
+    for (const it of imgItems) {
+      ctx.drawImage(it.img, 0, y, it.width, it.height);
+      y += it.height;
+    }
+    const blob = await canvasToBlob(canvas, mime, quality);
+    return { blob, width: w, height: h, mime };
+  }
+
+  // Main flow
   async function startCapture() {
     if (!document.body) throw new Error('No document body found');
 
@@ -91,24 +153,17 @@
     const originalOverflow = scrollingEl.style.overflow;
     const originalScrollTop = scrollingEl.scrollTop;
 
+    // Calculate full page positions BEFORE capturing
     const totalWidth = Math.max(document.documentElement.scrollWidth, document.body.scrollWidth);
     const totalHeight = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
     const viewportHeight = window.innerHeight;
 
-    // Hide fixed/sticky elements
-    const fixedEls = Array.from(document.querySelectorAll('*')).filter(el => {
-      const s = getComputedStyle(el);
-      return (s.position === 'fixed' || s.position === 'sticky') &&
-             s.display !== 'none' &&
-             el.offsetParent !== null;
-    });
-    const fixedCache = fixedEls.map(el => ({
-      el,
-      orig: { visibility: el.style.visibility, pointerEvents: el.style.pointerEvents }
-    }));
-    fixedEls.forEach(el => { el.style.visibility = 'hidden'; el.style.pointerEvents = 'none'; });
-
-    scrollingEl.style.overflow = 'hidden';
+    // Prevent page jumps during capture
+    try {
+      scrollingEl.style.overflow = 'hidden';
+    } catch (e) {
+      // ignore if cannot set
+    }
 
     const positions = [];
     for (let y = 0; y < totalHeight; y += viewportHeight) {
@@ -118,110 +173,114 @@
 
     const capturedDataUrls = [];
     for (const y of positions) {
+      // scroll to position (behavior auto for compatibility)
       scrollingEl.scrollTo({ top: y, left: 0, behavior: 'auto' });
       await new Promise(r => setTimeout(r, CAPTURE_DELAY_MS));
       const dataUrl = await safeCapture();
       capturedDataUrls.push(dataUrl);
     }
 
-    // restore
-    scrollingEl.scrollTo({ top: originalScrollTop, left: 0, behavior: 'auto' });
-    scrollingEl.style.overflow = originalOverflow;
-    fixedCache.forEach(it => {
-      it.el.style.visibility = it.orig.visibility || '';
-      it.el.style.pointerEvents = it.orig.pointerEvents || '';
-    });
+    // restore scroll/overflow
+    try {
+      scrollingEl.scrollTo({ top: originalScrollTop, left: 0, behavior: 'auto' });
+      scrollingEl.style.overflow = originalOverflow;
+    } catch (e) { /* ignore */ }
 
-    // Load all captures as images
+    // Load captured dataUrls into Image objects
     const images = [];
-    for (const d of capturedDataUrls) {
-      const img = await loadImage(d);
-      images.push({ img, width: img.width, height: img.height });
-    }
-
-    async function stitchImages(imgItems, mime = 'image/jpeg', quality = 0.95) {
-      const w = Math.max(...imgItems.map(i => i.width));
-      const h = imgItems.reduce((s, i) => s + i.height, 0);
-      const canvas = document.createElement('canvas');
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      let y = 0;
-      for (const it of imgItems) {
-        ctx.drawImage(it.img, 0, y, it.width, it.height);
-        y += it.height;
+    for (let idx = 0; idx < capturedDataUrls.length; idx++) {
+      const d = capturedDataUrls[idx];
+      try {
+        const img = await loadImage(d);
+        images.push({ img, width: img.width, height: img.height });
+      } catch (err) {
+        console.warn('Failed to load tile', idx, err);
+        // Skip this tile — proceed with others
       }
-      const blob = await canvasToBlob(canvas, mime, quality);
-      return { blob, width: w, height: h, mime };
     }
 
-    // 1️⃣ Try to make one big JPG at 0.97 (best quality)
-    const { blob: jpgHighBlob } = await stitchImages(images, 'image/jpeg', JPEG_QUALITY_HIGH);
-    if (jpgHighBlob.size <= MAX_BYTES) {
-      saveBlob(jpgHighBlob, 'jpg');
-      alert('Saved as JPG (quality 0.97, under 24MB)');
-      return;
-    }
+    if (images.length === 0) throw new Error('No captured images to stitch');
 
-    // 2️⃣ Try JPEG at 0.95
-    const { blob: jpgBlob } = await stitchImages(images, 'image/jpeg', JPEG_QUALITY);
-    if (jpgBlob.size <= MAX_BYTES) {
-      saveBlob(jpgBlob, 'jpg');
-      alert('Saved as JPG (quality 0.95, under 24MB)');
-      return;
-    }
+    // Break into safe height batches
+    const heightBatches = makeBatchesByHeight(images, MAX_CANVAS_HEIGHT);
 
-    // 3️⃣ Try one WebP at high quality (0.97)
-    let { blob: webpBlob } = await stitchImages(images, 'image/webp', WEBP_QUALITY_HIGH);
-    if (webpBlob.size <= MAX_BYTES) {
-      saveBlob(webpBlob, 'webp');
-      alert('Saved as WebP (quality 0.97, under 24MB)');
-      return;
-    }
+    const outputs = []; // { blob, ext, partIndex }
+    let partCounter = 0;
+    for (let b = 0; b < heightBatches.length; b++) {
+      const batch = heightBatches[b];
 
-    // 4️⃣ If still >24MB, retry with WebP 0.92
-    console.log(`JPG(0.97) was ${Math.round(jpgHighBlob.size / 1024 / 1024)}MB, JPG(0.95) was ${Math.round(jpgBlob.size / 1024 / 1024)}MB, WebP(0.97) was ${Math.round(webpBlob.size / 1024 / 1024)}MB. Retrying at WebP 0.92...`);
-    const retry = await stitchImages(images, 'image/webp', WEBP_QUALITY_FALLBACK);
-    webpBlob = retry.blob;
+      // Try sequence on this batch: JPG(0.97) -> JPG(0.95) -> WEBP(0.97) -> WEBP(0.92)
+      // 1) JPG 0.97
+      let attempt = await stitchImagesToBlob(batch, 'image/jpeg', JPEG_QUALITY_HIGH);
+      if (attempt.blob && attempt.blob.size <= MAX_BYTES) {
+        partCounter++;
+        outputs.push({ blob: attempt.blob, ext: 'jpg', partIndex: partCounter });
+        continue;
+      }
 
-    if (webpBlob.size <= MAX_BYTES) {
-      saveBlob(webpBlob, 'webp');
-      alert('Saved as WebP (quality 0.92, reduced for size)');
-      return;
-    }
+      // 2) JPG 0.95
+      attempt = await stitchImagesToBlob(batch, 'image/jpeg', JPEG_QUALITY);
+      if (attempt.blob && attempt.blob.size <= MAX_BYTES) {
+        partCounter++;
+        outputs.push({ blob: attempt.blob, ext: 'jpg', partIndex: partCounter });
+        continue;
+      }
 
-    // Safety fallback
-    const batches = [];
-    let currentBatch = [];
-    for (let i = 0; i < images.length; i++) {
-      const candidate = images[i];
-      const tryBatch = currentBatch.concat([candidate]);
-      const { blob: testBlob } = await stitchImages(tryBatch, 'image/webp', WEBP_QUALITY_FALLBACK);
-      if (testBlob.size <= MAX_BYTES) {
-        currentBatch = tryBatch;
-      } else {
-        if (currentBatch.length > 0) {
-          const { blob } = await stitchImages(currentBatch, 'image/webp', WEBP_QUALITY_FALLBACK);
-          batches.push(blob);
+      // 3) WEBP 0.97
+      attempt = await stitchImagesToBlob(batch, 'image/webp', WEBP_QUALITY_HIGH);
+      if (attempt.blob && attempt.blob.size <= MAX_BYTES) {
+        partCounter++;
+        outputs.push({ blob: attempt.blob, ext: 'webp', partIndex: partCounter });
+        continue;
+      }
+
+      // 4) WEBP 0.92
+      attempt = await stitchImagesToBlob(batch, 'image/webp', WEBP_QUALITY_FALLBACK);
+      if (attempt.blob && attempt.blob.size <= MAX_BYTES) {
+        partCounter++;
+        outputs.push({ blob: attempt.blob, ext: 'webp', partIndex: partCounter });
+        continue;
+      }
+
+      // Safety: If even WEBP 0.92 exceeds MAX_BYTES (unexpected), split the batch into single-image parts
+      // and encode each separately (very unlikely unless individual tiles are huge).
+      for (let i = 0; i < batch.length; i++) {
+        const single = [batch[i]];
+        let sAttempt = await stitchImagesToBlob(single, 'image/webp', WEBP_QUALITY_FALLBACK);
+        if (sAttempt.blob) {
+          if (sAttempt.blob.size <= MAX_BYTES) {
+            partCounter++;
+            outputs.push({ blob: sAttempt.blob, ext: 'webp', partIndex: partCounter });
+          } else {
+            // If even a single tile is too big, still push it (user may prefer it) — but warn in console
+            console.warn('Single tile exceeds MAX_BYTES; pushing as-is', sAttempt.blob.size);
+            partCounter++;
+            outputs.push({ blob: sAttempt.blob, ext: 'webp', partIndex: partCounter });
+          }
         }
-        currentBatch = [candidate];
       }
     }
-    if (currentBatch.length > 0) {
-      const { blob } = await stitchImages(currentBatch, 'image/webp', WEBP_QUALITY_FALLBACK);
-      batches.push(blob);
+
+    // Save outputs with timestamped filenames
+    const base = (new URL(location.href)).hostname.replace(/\./g, '_');
+    const ts = timestamp();
+    for (const out of outputs) {
+      const filename = out.partIndex > 1
+        ? `${base}_part${out.partIndex}_${ts}.${out.ext}`
+        : `${base}_fullpage_${ts}.${out.ext}`;
+      downloadBlob(out.blob, filename);
     }
 
-    for (let i = 0; i < batches.length; i++) {
-      saveBlob(batches[i], 'webp', i + 1);
+    if (outputs.length === 0) {
+      throw new Error('Failed to produce any output blobs');
     }
 
-    alert(`Saved as ${batches.length} WebP image(s) (each ≤${Math.round(MAX_BYTES / 1024 / 1024)}MB)`);
-
-    function saveBlob(blob, ext, index = 0) {
-      const base = (new URL(location.href)).hostname.replace(/\./g, '_');
-      const name = index ? `${base}_part${index}.${ext}` : `${base}_fullpage.${ext}`;
-      downloadBlob(blob, name);
+    // Inform user (brief)
+    if (outputs.length === 1) {
+      alert(`Saved 1 file (${Math.round(outputs[0].blob.size / 1024 / 1024)} MB): ${base}_fullpage_${ts}.${outputs[0].ext}`);
+    } else {
+      alert(`Saved ${outputs.length} file(s).`);
     }
   }
+
 })();
