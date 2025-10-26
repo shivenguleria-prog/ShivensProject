@@ -1,10 +1,8 @@
 // contentScript_fullpage_capture_zoomed.js
-// Full-page capture script with zoom-out before capture.
-// - Save as JPG first (quality controlled)
-// - If JPG > 24MB, try WebP q=0.97
-// - If still > 24MB, try WebP q=0.92 (assumed to fit)
-// - Hard-coded zoom out to 80% before capture, restore original after
-// - Scroll positions and measurements are calculated AFTER zoom change
+// Full-page capture script (without forced zoom).
+// - Save as JPG first (0.97 → 0.95)
+// - If both exceed 24MB, try WebP (0.97 → 0.92)
+// - Scroll positions and measurements are calculated normally
 
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
@@ -21,10 +19,6 @@
   const JPEG_QUALITY = 0.95; // second attempt for JPEG if high exceeds limit
   const WEBP_QUALITY_HIGH = 0.97; // fallback 1 for WebP
   const WEBP_QUALITY_FALLBACK = 0.92; // fallback 2 (assumed to be <= MAX_BYTES)
-
-  // Zoom configuration (hard-coded 80%)
-  const ZOOM_FACTOR = 0.8; // 80%
-  const ZOOM_APPLY_DELAY_MS = 300; // wait after applying zoom for layout to settle
   // ------------------------
 
   let lastCaptureTs = 0;
@@ -93,30 +87,15 @@
   async function startCapture() {
     if (!document.body) throw new Error('No document body found');
 
-    // Save original scroll position and overflow to restore later
     const scrollingEl = document.scrollingElement || document.documentElement;
     const originalOverflow = scrollingEl.style.overflow;
     const originalScrollTop = scrollingEl.scrollTop;
 
-    // Save & apply zoom on documentElement (and body as a fallback)
-    const docEl = document.documentElement;
-    const bodyEl = document.body;
-    const origDocZoom = docEl.style.zoom || '';
-    const origBodyZoom = bodyEl.style.zoom || '';
-
-    // Apply zoom out (80%)
-    docEl.style.zoom = String(ZOOM_FACTOR);
-    bodyEl.style.zoom = String(ZOOM_FACTOR);
-
-    // Give the page a moment to reflow at new zoom
-    await new Promise(r => setTimeout(r, ZOOM_APPLY_DELAY_MS));
-
-    // ---- Recalculate layout measurements AFTER zoom ----
     const totalWidth = Math.max(document.documentElement.scrollWidth, document.body.scrollWidth);
     const totalHeight = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
     const viewportHeight = window.innerHeight;
 
-    // Hide fixed/sticky elements (store originals to restore)
+    // Hide fixed/sticky elements
     const fixedEls = Array.from(document.querySelectorAll('*')).filter(el => {
       const s = getComputedStyle(el);
       return (s.position === 'fixed' || s.position === 'sticky') &&
@@ -145,17 +124,13 @@
       capturedDataUrls.push(dataUrl);
     }
 
-    // restore scroll position, overflow, and fixed element styles
+    // restore
     scrollingEl.scrollTo({ top: originalScrollTop, left: 0, behavior: 'auto' });
     scrollingEl.style.overflow = originalOverflow;
     fixedCache.forEach(it => {
       it.el.style.visibility = it.orig.visibility || '';
       it.el.style.pointerEvents = it.orig.pointerEvents || '';
     });
-
-    // Restore original zoom
-    docEl.style.zoom = origDocZoom;
-    bodyEl.style.zoom = origBodyZoom;
 
     // Load all captures as images
     const images = [];
@@ -164,8 +139,7 @@
       images.push({ img, width: img.width, height: img.height });
     }
 
-    // helper: stitch vertically
-    async function stitchImages(imgItems, mime = 'image/jpeg', quality = JPEG_QUALITY) {
+    async function stitchImages(imgItems, mime = 'image/jpeg', quality = 0.95) {
       const w = Math.max(...imgItems.map(i => i.width));
       const h = imgItems.reduce((s, i) => s + i.height, 0);
       const canvas = document.createElement('canvas');
@@ -205,19 +179,18 @@
       return;
     }
 
-    // 4️⃣ If still >24MB, retry with WebP 0.92 (assumed to be <= MAX_BYTES)
+    // 4️⃣ If still >24MB, retry with WebP 0.92
     console.log(`JPG(0.97) was ${Math.round(jpgHighBlob.size / 1024 / 1024)}MB, JPG(0.95) was ${Math.round(jpgBlob.size / 1024 / 1024)}MB, WebP(0.97) was ${Math.round(webpBlob.size / 1024 / 1024)}MB. Retrying at WebP 0.92...`);
     const retry = await stitchImages(images, 'image/webp', WEBP_QUALITY_FALLBACK);
     webpBlob = retry.blob;
 
-    // According to requirement, WebP 0.92 will be ≤ MAX_BYTES. Still check and save.
     if (webpBlob.size <= MAX_BYTES) {
       saveBlob(webpBlob, 'webp');
       alert('Saved as WebP (quality 0.92, reduced for size)');
       return;
     }
 
-    // Safety fallback: if WebP 0.92 still exceeds MAX_BYTES (unexpected), split into multiple webps at 0.92
+    // Safety fallback
     const batches = [];
     let currentBatch = [];
     for (let i = 0; i < images.length; i++) {
@@ -245,7 +218,6 @@
 
     alert(`Saved as ${batches.length} WebP image(s) (each ≤${Math.round(MAX_BYTES / 1024 / 1024)}MB)`);
 
-    // save helper
     function saveBlob(blob, ext, index = 0) {
       const base = (new URL(location.href)).hostname.replace(/\./g, '_');
       const name = index ? `${base}_part${index}.${ext}` : `${base}_fullpage.${ext}`;
