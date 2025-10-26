@@ -1,9 +1,5 @@
 // contentScript.js
-// Full-page capture with:
-// - Zoom-out scaling
-// - Scroll + capture + adaptive WebP quality
-// - Fixed/sticky elements scroll along
-// - Auto fallback for large captures
+// Full-page capture with zoom, adaptive WebP, and automatic fixed-element detection/removal.
 
 (() => {
   if (window.__FULLPAGE_CAPTURE_INSTALLED) return;
@@ -16,7 +12,7 @@
   const CAPTURE_RETRY_BASE_DELAY = 300;
   const WEBP_QUALITY_PRIMARY = 0.97;
   const WEBP_QUALITY_FALLBACK = 0.92;
-  const ZOOM_FACTOR = 0.8; // Zoom out to 80%
+  const ZOOM_FACTOR = 0.8; // 80% zoom out
   // ------------------------
 
   let lastCaptureTs = 0;
@@ -81,6 +77,33 @@
     URL.revokeObjectURL(url);
   }
 
+  // ---------- DETECT VISUALLY FIXED ELEMENTS ----------
+  async function detectVisuallyFixedElements() {
+    const scrollTest = 150;
+    const fixedCandidates = Array.from(document.querySelectorAll("body *"))
+      .filter((el) => el.offsetParent !== null && el.getClientRects().length);
+
+    const beforePositions = new Map();
+    for (const el of fixedCandidates) {
+      beforePositions.set(el, el.getBoundingClientRect().top);
+    }
+
+    window.scrollBy(0, scrollTest);
+    await new Promise((r) => setTimeout(r, 120));
+
+    const fixedDetected = [];
+    for (const el of fixedCandidates) {
+      const beforeTop = beforePositions.get(el);
+      const afterTop = el.getBoundingClientRect().top;
+      if (Math.abs(afterTop - beforeTop) < 1) fixedDetected.push(el);
+    }
+
+    window.scrollBy(0, -scrollTest);
+    await new Promise((r) => setTimeout(r, 100));
+
+    return fixedDetected;
+  }
+
   // ---------- MAIN CAPTURE ----------
   async function startCapture() {
     if (!document.body) throw new Error("No document body found");
@@ -91,45 +114,41 @@
     const originalZoom = document.documentElement.style.zoom || "";
 
     try {
-      // 1️⃣ Apply zoom before measuring
+      // 1️⃣ Apply zoom
       document.documentElement.style.zoom = String(ZOOM_FACTOR);
-      await new Promise((r) => setTimeout(r, 150)); // allow layout reflow
+      await new Promise((r) => setTimeout(r, 150));
 
-      // 2️⃣ Measure after zoom
-      const totalHeight = Math.max(
-        document.documentElement.scrollHeight,
-        document.body.scrollHeight
-      );
-      const viewportHeight = window.innerHeight;
-
-      // 3️⃣ Convert fixed/sticky elements to scrollable
-      const fixedEls = Array.from(document.querySelectorAll("*")).filter((el) => {
-        const s = getComputedStyle(el);
-        return (
-          (s.position === "fixed" || s.position === "sticky") &&
-          s.display !== "none" &&
-          el.offsetParent !== null
-        );
-      });
-      const fixedCache = fixedEls.map((el) => ({
+      // 2️⃣ Detect visually fixed elements (including JS-based or transformed)
+      const visuallyFixed = await detectVisuallyFixedElements();
+      const styleCache = visuallyFixed.map((el) => ({
         el,
         orig: {
           position: el.style.position,
           top: el.style.top,
           bottom: el.style.bottom,
           zIndex: el.style.zIndex,
+          transform: el.style.transform,
         },
       }));
-      fixedEls.forEach((el) => {
-        el.style.position = "static";
-        el.style.top = "auto";
-        el.style.bottom = "auto";
-        el.style.zIndex = "auto";
+
+      visuallyFixed.forEach((el) => {
+        el.style.setProperty("position", "static", "important");
+        el.style.setProperty("top", "auto", "important");
+        el.style.setProperty("bottom", "auto", "important");
+        el.style.setProperty("z-index", "auto", "important");
+        el.style.setProperty("transform", "none", "important");
       });
+
+      // 3️⃣ Measure after zoom
+      const totalHeight = Math.max(
+        document.documentElement.scrollHeight,
+        document.body.scrollHeight
+      );
+      const viewportHeight = window.innerHeight;
 
       scrollingEl.style.overflow = "hidden";
 
-      // 4️⃣ Compute scroll positions precisely (no overlap)
+      // 4️⃣ Compute scroll positions (no overlap)
       const positions = [];
       let y = 0;
       while (y < totalHeight - viewportHeight) {
@@ -138,7 +157,7 @@
       }
       positions.push(totalHeight - viewportHeight);
 
-      // 5️⃣ Capture each scroll
+      // 5️⃣ Capture
       const capturedDataUrls = [];
       for (const pos of positions) {
         scrollingEl.scrollTo({ top: pos, left: 0, behavior: "instant" });
@@ -147,20 +166,21 @@
         capturedDataUrls.push(dataUrl);
       }
 
-      // 6️⃣ Restore DOM state
+      // 6️⃣ Restore scroll and styles
       scrollingEl.scrollTo({ top: originalScrollTop, left: 0, behavior: "instant" });
       scrollingEl.style.overflow = originalOverflow;
       document.documentElement.style.zoom = originalZoom;
 
-      fixedCache.forEach((it) => {
+      for (const it of styleCache) {
         const s = it.el.style;
         s.position = it.orig.position || "";
         s.top = it.orig.top || "";
         s.bottom = it.orig.bottom || "";
         s.zIndex = it.orig.zIndex || "";
-      });
+        s.transform = it.orig.transform || "";
+      }
 
-      // 7️⃣ Load captures as images
+      // 7️⃣ Load captures
       const images = [];
       for (const d of capturedDataUrls) {
         const img = await loadImage(d);
@@ -184,7 +204,7 @@
         return { blob, width: w, height: h, mime };
       }
 
-      // 8️⃣ Try PNG
+      // 8️⃣ PNG first
       const { blob: pngBlob } = await stitchImages(images, "image/png");
       if (pngBlob.size <= MAX_BYTES) {
         saveBlob(pngBlob, "png");
@@ -192,7 +212,7 @@
         return;
       }
 
-      // 9️⃣ Try WebP at 0.97
+      // 9️⃣ WebP at 0.97
       const { blob: webp97 } = await stitchImages(images, "image/webp", WEBP_QUALITY_PRIMARY);
       if (webp97.size <= MAX_BYTES) {
         saveBlob(webp97, "webp");
@@ -200,7 +220,7 @@
         return;
       }
 
-      // 🔟 Try WebP at 0.92
+      // 🔟 WebP at 0.92
       const { blob: webp92 } = await stitchImages(images, "image/webp", WEBP_QUALITY_FALLBACK);
       if (webp92.size <= MAX_BYTES) {
         saveBlob(webp92, "webp");
@@ -208,7 +228,7 @@
         return;
       }
 
-      // 11️⃣ Split into multiple parts (batches)
+      // 11️⃣ Split if still too large
       const batches = [];
       let currentBatch = [];
       for (let i = 0; i < images.length; i++) {
@@ -230,33 +250,33 @@
         batches.push(blob);
       }
 
-      // 12️⃣ Save batches, fallback to 0.92 if needed
+      // 12️⃣ Save all batches
       for (let i = 0; i < batches.length; i++) {
         let blob = batches[i];
         if (blob.size > MAX_BYTES) {
-          const { blob: fallbackBlob } = await stitchImages(
+          const { blob: fallback } = await stitchImages(
             [images[i]],
             "image/webp",
             WEBP_QUALITY_FALLBACK
           );
-          blob = fallbackBlob;
+          blob = fallback;
         }
         saveBlob(blob, "webp", i + 1);
       }
 
-      alert(`Saved as ${batches.length} WebP image(s) (≤19MB each)`);
+      alert(`Saved as ${batches.length} WebP image(s) (each ≤19MB)`);
 
-      // Helper: download
+      // Helper
       function saveBlob(blob, ext, index = 0) {
         const base = new URL(location.href).hostname.replace(/\./g, "_");
         const name = index ? `${base}_part${index}.${ext}` : `${base}_fullpage.${ext}`;
         downloadBlob(blob, name);
       }
     } catch (err) {
-      document.documentElement.style.zoom = originalZoom;
-      scrollingEl.style.overflow = originalOverflow;
       console.error(err);
       alert("Capture failed: " + err.message);
+      try { document.documentElement.style.zoom = originalZoom; } catch {}
+      try { scrollingEl.style.overflow = originalOverflow; } catch {}
     }
   }
 })();
