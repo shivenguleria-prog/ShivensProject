@@ -1,25 +1,34 @@
-document.getElementById('capture').addEventListener('click', async () => {
-  const statusEl = document.getElementById('status');
-  statusEl.textContent = 'Preparing...';
+// popup.js
+(function () {
+  const btn =
+    document.getElementById("captureBtn") ||
+    document.getElementById("startCapture") ||
+    document.querySelector("[data-action='capture']") ||
+    document.querySelector("button"); // fallback to first button
 
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab) {
-    statusEl.textContent = 'No active tab';
+  const statusEl =
+    document.getElementById("status") ||
+    document.getElementById("statusText") ||
+    document.querySelector(".status") ||
+    { textContent: "" };
+
+  if (!btn) {
+    console.warn("Popup: no capture button found. Ensure #captureBtn exists.");
     return;
   }
 
-  // Inject content script (ensures contentScript.js is available in the page context)
-  await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    files: ['contentScript.js']
+  btn.addEventListener("click", async () => {
+    statusEl.textContent = "Capturing…";
+    try {
+      const resp = await chrome.runtime.sendMessage({ action: "capture-visible" });
+      if (resp && resp.success) {
+        statusEl.textContent = "Opened in new tab.";
+      } else {
+        statusEl.textContent = "Failed to capture.";
+      }
+    } catch (e) {
+      console.error("Popup -> background error:", e);
+      statusEl.textContent = "Error: Could not start capture.";
+    }
   });
-
-  // Ask the content script to start
-  chrome.tabs.sendMessage(tab.id, { action: 'start-capture' }, (resp) => {
-    // optional: we can listen for any immediate response
-    // actual progress will be shown via in-page alerts or downloads
-  });
-
-  // Close popup to let content script run in page tab
-  window.close();
-});
+})();
