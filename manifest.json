@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Full Page Capture Pro",
-  "version": "1.0.2",
+  "version": "1.0.4",
   "description": "Full-page capture with an in-tab viewer (zoom, pan, crop, rotate, flip, download).",
   "permissions": [
     "tabs",
     "activeTab",
     "scripting",
-    "downloads"
+    "downloads",
+    "storage"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
