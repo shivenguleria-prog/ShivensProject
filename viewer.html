@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Image Viewer — Full Page Capture</title>
+  <link rel="stylesheet" href="viewer.css" />
+</head>
+<body>
+  <div id="toolbar">
+    <div class="left">
+      <button id="zoomOut">-</button>
+      <input id="zoomRange" type="range" min="10" max="300" value="100" />
+      <button id="zoomIn">+</button>
+      <button id="fitBtn" title="Fit to screen">Fit</button>
+      <button id="resetBtn" title="Reset">Reset</button>
+    </div>
+
+    <div class="center">
+      <label>Crop aspect:</label>
+      <select id="aspectSelect">
+        <option value="free">Free</option>
+        <option value="1">1:1</option>
+        <option value="16/9">16:9</option>
+        <option value="4/3">4:3</option>
+      </select>
+    </div>
+
+    <div class="right">
+      <button id="rotateLeft" title="Rotate -90">⟲</button>
+      <button id="rotateRight" title="Rotate +90">⟳</button>
+      <button id="flipH" title="Flip Horizontal">⇋</button>
+      <button id="flipV" title="Flip Vertical">⇅</button>
+
+      <button id="startCrop" title="Start Crop">Crop</button>
+
+      <select id="downloadFormat">
+        <option value="image/webp">webp</option>
+        <option value="image/png">png</option>
+        <option value="image/jpeg">jpg</option>
+      </select>
+      <button id="downloadBtn" title="Download cropped / current view">Download</button>
+    </div>
+  </div>
+
+  <div id="viewerArea">
+    <div id="imgContainer">
+      <img id="mainImage" draggable="false" />
+      <canvas id="overlayCanvas"></canvas>
+      <div id="selection" hidden></div>
+    </div>
+  </div>
+
+  <script src="viewer.js"></script>
+</body>
+</html>
