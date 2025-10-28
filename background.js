@@ -1,16 +1,19 @@
-// background.js (MV3)
-// Capture visible tab, store data URL to chrome.storage.local, open viewer.html with key.
+// background.js (MV3) — supports stitching flow
+// Messages:
+// - { action: 'start-full-capture' }  // from popup -> start flow (inject content script & send begin message)
+// - { action: 'capture-for-stitch' } // from content script -> returns dataUrl of visible tab
+// - { action: 'store-and-open', dataUrl } // from content script -> store & open viewer
 
-async function captureVisibleWithRetries(maxRetries = 3, delayMs = 250) {
+// Helper: capture visible tab with retries
+async function captureVisibleWithRetries(maxRetries = 3, delayMs = 200) {
   if (!chrome.tabs || typeof chrome.tabs.captureVisibleTab !== 'function') {
-    throw new Error('chrome.tabs.captureVisibleTab is not available in this context');
+    throw new Error('chrome.tabs.captureVisibleTab not available');
   }
-
   let lastErr = null;
   for (let i = 0; i < maxRetries; i++) {
     try {
       const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'jpeg', quality: 95 });
-      if (!dataUrl) throw new Error('captureVisibleTab returned empty dataUrl');
+      if (!dataUrl) throw new Error('empty dataUrl from captureVisibleTab');
       return dataUrl;
     } catch (err) {
       lastErr = err;
@@ -18,56 +21,90 @@ async function captureVisibleWithRetries(maxRetries = 3, delayMs = 250) {
       await new Promise((r) => setTimeout(r, delayMs * (i + 1)));
     }
   }
-  throw lastErr || new Error('captureVisibleTab failed after retries');
+  throw lastErr || new Error('captureVisibleTab failed');
 }
 
+// Listener
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (!msg || msg.action !== 'capture-visible') return false;
+  if (!msg || !msg.action) return false;
 
-  (async () => {
-    try {
-      console.log('[background] capture-visible request received');
-
-      // 1) capture visible tab
-      let dataUrl;
+  // 1) Start-full-capture: inject content script and tell it to begin
+  if (msg.action === 'start-full-capture') {
+    (async () => {
       try {
-        dataUrl = await captureVisibleWithRetries(3, 300);
-        console.log('[background] capture succeeded, size:', (dataUrl && dataUrl.length) || 0);
-      } catch (capErr) {
-        console.error('[background] capture failed:', capErr);
-        sendResponse({ success: false, error: `capture failed: ${capErr && capErr.message ? capErr.message : String(capErr)}` });
-        return;
+        // Find active tab
+        const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tabs || !tabs[0]) {
+          sendResponse({ success: false, error: 'No active tab' });
+          return;
+        }
+        const tab = tabs[0];
+
+        // Do not inject on restricted pages
+        if (!tab.url || tab.url.startsWith('chrome://') || tab.url.startsWith('chrome.google.com/webstore')) {
+          sendResponse({ success: false, error: 'Cannot run on this page (internal or webstore).' });
+          return;
+        }
+
+        // Inject contentScript.js into tab
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['contentScript.js']
+        });
+
+        // Tell the content script to begin stitch capture
+        chrome.tabs.sendMessage(tab.id, { action: 'begin-stitch' }, (resp) => {
+          if (chrome.runtime.lastError) {
+            console.error('[background] sendMessage to content script failed:', chrome.runtime.lastError.message);
+            sendResponse({ success: false, error: `sendMessage failed: ${chrome.runtime.lastError.message}` });
+            return;
+          }
+          sendResponse({ success: true, info: 'content script started' });
+        });
+      } catch (err) {
+        console.error('[background] start-full-capture failed:', err);
+        sendResponse({ success: false, error: err && err.message ? err.message : String(err) });
       }
+    })();
+    return true;
+  }
 
-      // 2) store dataUrl in chrome.storage.local under a stable key
-      const storageKey = `capture_${Date.now()}`;
+  // 2) capture-for-stitch: background captures and returns dataUrl directly
+  if (msg.action === 'capture-for-stitch') {
+    (async () => {
       try {
-        await chrome.storage.local.set({ [storageKey]: dataUrl });
-        console.log('[background] stored dataUrl to chrome.storage.local as', storageKey);
-      } catch (stErr) {
-        console.error('[background] storage.set failed:', stErr);
-        sendResponse({ success: false, error: `storage.set failed: ${stErr && stErr.message ? stErr.message : String(stErr)}` });
-        return;
+        const dataUrl = await captureVisibleWithRetries();
+        sendResponse({ success: true, dataUrl });
+      } catch (err) {
+        console.error('[background] capture-for-stitch failed:', err);
+        sendResponse({ success: false, error: err && err.message ? err.message : String(err) });
       }
+    })();
+    return true;
+  }
 
-      // 3) open viewer.html passing the storage key (not the full base64)
+  // 3) store-and-open: store provided dataURL under a key and open viewer.html?srcKey=...
+  if (msg.action === 'store-and-open') {
+    (async () => {
       try {
-        const viewerUrl = chrome.runtime.getURL(`viewer.html?srcKey=${encodeURIComponent(storageKey)}`);
+        const dataUrl = msg.dataUrl;
+        if (!dataUrl) {
+          sendResponse({ success: false, error: 'no dataUrl provided' });
+          return;
+        }
+        const key = `capture_${Date.now()}`;
+        await chrome.storage.local.set({ [key]: dataUrl });
+        const viewerUrl = chrome.runtime.getURL(`viewer.html?srcKey=${encodeURIComponent(key)}`);
         await chrome.tabs.create({ url: viewerUrl });
-        console.log('[background] opened viewer:', viewerUrl);
-      } catch (openErr) {
-        console.error('[background] open viewer failed:', openErr);
-        sendResponse({ success: false, error: `open viewer failed: ${openErr && openErr.message ? openErr.message : String(openErr)}` });
-        return;
+        sendResponse({ success: true, key });
+      } catch (err) {
+        console.error('[background] store-and-open failed:', err);
+        sendResponse({ success: false, error: err && err.message ? err.message : String(err) });
       }
+    })();
+    return true;
+  }
 
-      // success
-      sendResponse({ success: true, key: storageKey });
-    } catch (fatal) {
-      console.error('[background] unexpected error:', fatal);
-      sendResponse({ success: false, error: `unexpected: ${fatal && fatal.message ? fatal.message : String(fatal)}` });
-    }
-  })();
-
-  return true; // keep the sendResponse channel open
+  return false;
 });
+
