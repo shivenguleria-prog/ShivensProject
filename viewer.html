@@ -3,43 +3,42 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Image Viewer — Full Page Capture</title>
+  <title>Screenshot Viewer</title>
   <link rel="stylesheet" href="viewer.css" />
 </head>
 <body>
   <div id="toolbar">
     <div class="left">
-      <button id="zoomOut">-</button>
+      <button id="zoomOut" title="Zoom out">-</button>
       <input id="zoomRange" type="range" min="10" max="300" value="100" />
-      <button id="zoomIn">+</button>
+      <button id="zoomIn" title="Zoom in">+</button>
       <button id="fitBtn" title="Fit to screen">Fit</button>
       <button id="resetBtn" title="Reset">Reset</button>
     </div>
 
     <div class="center">
-      <label>Crop aspect:</label>
+      <label for="aspectSelect">Crop:</label>
       <select id="aspectSelect">
         <option value="free">Free</option>
         <option value="1">1:1</option>
         <option value="16/9">16:9</option>
         <option value="4/3">4:3</option>
       </select>
+      <button id="startCrop" title="Start crop">Crop</button>
     </div>
 
     <div class="right">
       <button id="rotateLeft" title="Rotate -90">⟲</button>
       <button id="rotateRight" title="Rotate +90">⟳</button>
-      <button id="flipH" title="Flip Horizontal">⇋</button>
-      <button id="flipV" title="Flip Vertical">⇅</button>
+      <button id="flipH" title="Flip horizontal">⇋</button>
+      <button id="flipV" title="Flip vertical">⇅</button>
 
-      <button id="startCrop" title="Start Crop">Crop</button>
-
-      <select id="downloadFormat">
+      <select id="downloadFormat" title="Format">
         <option value="image/webp">webp</option>
         <option value="image/png">png</option>
         <option value="image/jpeg">jpg</option>
       </select>
-      <button id="downloadBtn" title="Download cropped / current view">Download</button>
+      <button id="downloadBtn" title="Download">Download</button>
     </div>
   </div>
 
