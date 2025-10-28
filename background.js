@@ -1,19 +1,18 @@
-// background.js (MV3) — supports stitching flow
-// Messages:
-// - { action: 'start-full-capture' }  // from popup -> start flow (inject content script & send begin message)
-// - { action: 'capture-for-stitch' } // from content script -> returns dataUrl of visible tab
-// - { action: 'store-and-open', dataUrl } // from content script -> store & open viewer
+// background.js
+// Integrates with your merged contentScript.js that:
+//  - listens for { action: 'start-capture' } to begin
+//  - calls chrome.runtime.sendMessage({ action: 'capture-visible' }) to request captures
 
-// Helper: capture visible tab with retries
-async function captureVisibleWithRetries(maxRetries = 3, delayMs = 200) {
+// Helper: captureVisibleTab with retries
+async function captureVisibleWithRetries(maxRetries = 3, delayMs = 250) {
   if (!chrome.tabs || typeof chrome.tabs.captureVisibleTab !== 'function') {
-    throw new Error('chrome.tabs.captureVisibleTab not available');
+    throw new Error('chrome.tabs.captureVisibleTab is not available in this context');
   }
   let lastErr = null;
   for (let i = 0; i < maxRetries; i++) {
     try {
       const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'jpeg', quality: 95 });
-      if (!dataUrl) throw new Error('empty dataUrl from captureVisibleTab');
+      if (!dataUrl) throw new Error('captureVisibleTab returned empty dataUrl');
       return dataUrl;
     } catch (err) {
       lastErr = err;
@@ -21,90 +20,76 @@ async function captureVisibleWithRetries(maxRetries = 3, delayMs = 200) {
       await new Promise((r) => setTimeout(r, delayMs * (i + 1)));
     }
   }
-  throw lastErr || new Error('captureVisibleTab failed');
+  throw lastErr || new Error('captureVisibleTab failed after retries');
 }
 
-// Listener
+// Message handler
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.action) return false;
 
-  // 1) Start-full-capture: inject content script and tell it to begin
-  if (msg.action === 'start-full-capture') {
+  // popup -> background: start capture flow
+  if (msg.action === 'start-capture') {
     (async () => {
       try {
-        // Find active tab
+        // find active tab
         const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
         if (!tabs || !tabs[0]) {
-          sendResponse({ success: false, error: 'No active tab' });
+          sendResponse({ success: false, error: 'No active tab found' });
           return;
         }
         const tab = tabs[0];
 
-        // Do not inject on restricted pages
+        // do not run on internal chrome pages or webstore
         if (!tab.url || tab.url.startsWith('chrome://') || tab.url.startsWith('chrome.google.com/webstore')) {
-          sendResponse({ success: false, error: 'Cannot run on this page (internal or webstore).' });
+          sendResponse({ success: false, error: 'Cannot inject into this page (internal/webstore).' });
           return;
         }
 
-        // Inject contentScript.js into tab
-        await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          files: ['contentScript.js']
-        });
+        // Inject contentScript.js (MV3 runtime injection)
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ['contentScript.js']
+          });
+        } catch (injErr) {
+          console.error('[background] injection failed:', injErr);
+          // If contentScript was already registered statically via manifest content_scripts, injection may fail - still try to message
+        }
 
-        // Tell the content script to begin stitch capture
-        chrome.tabs.sendMessage(tab.id, { action: 'begin-stitch' }, (resp) => {
+        // Give the page a small tick to register listeners (optional)
+        await new Promise((r) => setTimeout(r, 60));
+
+        // Send message to content script to begin capture (content script listens for 'start-capture')
+        chrome.tabs.sendMessage(tab.id, { action: 'start-capture' }, (resp) => {
           if (chrome.runtime.lastError) {
             console.error('[background] sendMessage to content script failed:', chrome.runtime.lastError.message);
-            sendResponse({ success: false, error: `sendMessage failed: ${chrome.runtime.lastError.message}` });
+            sendResponse({ success: false, error: chrome.runtime.lastError.message });
             return;
           }
-          sendResponse({ success: true, info: 'content script started' });
+          sendResponse({ success: true, info: 'capture started in page' });
         });
       } catch (err) {
-        console.error('[background] start-full-capture failed:', err);
+        console.error('[background] start-capture failed:', err);
         sendResponse({ success: false, error: err && err.message ? err.message : String(err) });
       }
     })();
-    return true;
+    return true; // keep channel open
   }
 
-  // 2) capture-for-stitch: background captures and returns dataUrl directly
-  if (msg.action === 'capture-for-stitch') {
+  // contentScript -> background: actual capture request for a tile
+  if (msg.action === 'capture-visible') {
     (async () => {
       try {
-        const dataUrl = await captureVisibleWithRetries();
+        const dataUrl = await captureVisibleWithRetries(3, 250);
         sendResponse({ success: true, dataUrl });
       } catch (err) {
-        console.error('[background] capture-for-stitch failed:', err);
+        console.error('[background] capture-visible failed:', err);
         sendResponse({ success: false, error: err && err.message ? err.message : String(err) });
       }
     })();
     return true;
   }
 
-  // 3) store-and-open: store provided dataURL under a key and open viewer.html?srcKey=...
-  if (msg.action === 'store-and-open') {
-    (async () => {
-      try {
-        const dataUrl = msg.dataUrl;
-        if (!dataUrl) {
-          sendResponse({ success: false, error: 'no dataUrl provided' });
-          return;
-        }
-        const key = `capture_${Date.now()}`;
-        await chrome.storage.local.set({ [key]: dataUrl });
-        const viewerUrl = chrome.runtime.getURL(`viewer.html?srcKey=${encodeURIComponent(key)}`);
-        await chrome.tabs.create({ url: viewerUrl });
-        sendResponse({ success: true, key });
-      } catch (err) {
-        console.error('[background] store-and-open failed:', err);
-        sendResponse({ success: false, error: err && err.message ? err.message : String(err) });
-      }
-    })();
-    return true;
-  }
-
+  // Optionally other actions...
   return false;
 });
-
