@@ -1,9 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Full Page Capture Pro",
-  "version": "1.0.1",
-  "description": "Commercial-grade full page capture with robust stitching and compression.",
-  "permissions": ["tabs", "activeTab", "scripting", "downloads"],
+  "version": "1.0.2",
+  "description": "Full-page capture with an in-tab viewer (zoom, pan, crop, rotate, flip, download).",
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "scripting",
+    "downloads"
+  ],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js",
@@ -13,13 +18,6 @@
     "default_title": "Full Page Capture",
     "default_popup": "popup.html"
   },
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["contentScript.js"],
-      "run_at": "document_idle"
-    }
-  ],
   "web_accessible_resources": [
     {
       "resources": ["viewer.html", "viewer.js", "viewer.css"],
