@@ -1,4 +1,4 @@
-// popup.js
+// popup.js — send start-capture to background
 (function () {
   const btn =
     document.getElementById("captureBtn") ||
@@ -17,21 +17,21 @@
   }
 
   btn.addEventListener("click", async () => {
-    statusEl.textContent = "Capturing…";
+    statusEl.textContent = "Initializing capture…";
     try {
-      const resp = await chrome.runtime.sendMessage({ action: "capture-visible" });
+      const resp = await chrome.runtime.sendMessage({ action: 'start-capture' });
       if (resp && resp.success) {
-        statusEl.textContent = "Opened in new tab.";
+        statusEl.textContent = 'Capture started — observe the tab.';
       } else {
-        const err = resp && resp.error ? resp.error : "unknown error";
-        alert("Capture failed: " + err);
-        statusEl.textContent = "Failed to capture.";
-        console.error("capture-visible failed:", resp);
+        const err = resp && resp.error ? resp.error : 'unknown error';
+        alert('Could not start capture: ' + err);
+        statusEl.textContent = 'Failed';
+        console.error('start-capture response:', resp);
       }
     } catch (e) {
-      console.error("Popup -> background error:", e);
-      alert("Message failed: " + (e && e.message ? e.message : e));
-      statusEl.textContent = "Error: Could not start capture.";
+      console.error('popup -> background error:', e);
+      alert('Message failed: ' + (e && e.message ? e.message : e));
+      statusEl.textContent = 'Error';
     }
   });
 })();
